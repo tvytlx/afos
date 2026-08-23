@@ -35,13 +35,13 @@ whether afos *boots* — only T2 can, which is why T2 is the gate rather than th
 workbench.
 
 ```bash
-make test      # 9 tests, no container needed
+make test      # 25 tests, no container needed
 make boot      # downloads the Ubuntu cloud image, provisions it, boots it
 make accept    # every tier's acceptance checks, fast to slow
 ```
 
 Acceptance is executable, not a checklist to read — each tier prints PASS/FAIL
-per criterion. Last full run: **T0 13/13 · T1 18/18 · T2 20/20**. What each
+per criterion. Last full run: **T0 13/13 · T1 18/18 · T2 32/32**. What each
 tier can and cannot prove: [docs/acceptance.md](docs/acceptance.md).
 
 `make boot` uses QEMU on the serial console — there is no display to attach to,

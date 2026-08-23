@@ -17,6 +17,7 @@ afos v0 -- no model wired up yet. Builtins:
 
   :help              this
   :exec <cmd>        run a shell command (shell is a capability, not an entry)
+  :timeout [secs]    show or set this session's command timeout
   :sessions          list sessions in this daemon
   :who               this session and its attached frontends
   :quit              detach this frontend (the session keeps running)
@@ -50,6 +51,21 @@ class BuiltinBrain:
                 return
             rc = await session.run_shell(arg)
             await session.emit("system", f"exit {rc}")
+
+        elif cmd == "timeout":
+            if not arg:
+                await session.emit("system", f"timeout is {session.exec_timeout:.0f}s")
+                return
+            try:
+                seconds = float(arg)
+            except ValueError:
+                await session.emit("error", f"not a number: {arg!r}")
+                return
+            if seconds <= 0:
+                await session.emit("error", "timeout must be positive")
+                return
+            session.exec_timeout = seconds
+            await session.emit("system", f"timeout set to {seconds:.0f}s")
 
         elif cmd == "sessions":
             reg = session.registry

@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import signal
 import sys
 import threading
+import time
 from typing import Any, AsyncIterator
 
 from .protocol import READ_LIMIT, SOCKET_PATH, ProtocolError, decode, encode
@@ -34,7 +36,10 @@ class Console:
         socket_path: str,
         session: str | None,
         color: bool,
-        linger: float = 5.0,
+        # Must exceed the daemon's bye-drain (30s), or the console gives up
+        # on exactly the output the daemon stayed open to deliver -- and
+        # exits 0, so the truncation looks like the command's real output.
+        linger: float = 35.0,
         wait: bool = False,
     ) -> None:
         self.socket_path = socket_path
@@ -45,8 +50,17 @@ class Console:
         self.busy = False
 
     def _write(self, text: str) -> None:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        # Belt and braces: if anything ever leaves this fd non-blocking, a
+        # burst of output must not be fatal to the only console on the box.
+        for _ in range(200):
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                return
+            except BlockingIOError:
+                time.sleep(0.01)
+            except (BrokenPipeError, ValueError):
+                return
 
     def _render(self, frame: dict[str, Any]) -> None:
         kind = frame.get("t")
@@ -86,6 +100,14 @@ class Console:
             signal.SIGINT,
             lambda: (writer.write(encode({"t": "interrupt"})), self._write("^C\n")),
         )
+        # There is nothing to suspend to. A getty could be stopped and the
+        # kernel would still hand the tty to a shell; this console being
+        # stopped leaves the machine with no interactive entry at all, and
+        # systemd's Restart= cannot see a stopped process -- the unit still
+        # reports active. So the terminal reflex must be inert here.
+        for sig in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU, signal.SIGQUIT):
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(sig, signal.SIG_IGN)
 
         incoming = asyncio.create_task(self._drain(reader))
         outgoing = asyncio.create_task(self._forward_stdin(writer))
@@ -155,31 +177,24 @@ class Console:
 
 
 async def _stdin_lines() -> AsyncIterator[str]:
-    """Yield lines from stdin, whatever stdin happens to be.
+    """Yield lines from stdin.
 
-    connect_read_pipe is the right mechanism for a tty (tty1, the case that
-    ships) and for a pipe, but it rejects a regular file -- which is how a
-    scripted test feeds the console. Falling back to a daemon thread covers
-    that without making the shipping path pay for it.
+    Deliberately a thread rather than loop.connect_read_pipe(). On a tty,
+    systemd hands the unit the same open file description for stdin and stdout,
+    and connect_read_pipe sets O_NONBLOCK on it -- so the first burst of output
+    that fills the tty buffer makes sys.stdout.write raise BlockingIOError and
+    the machine's only console exits. A daemon thread parked in read() costs
+    nothing and mutates no flags.
     """
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    try:
-        await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
-    except ValueError:
-        async for line in _threaded_stdin(loop):
-            yield line
-        return
-    async for raw in reader:
-        yield raw.decode("utf-8", "replace").rstrip("\n")
-
-
-async def _threaded_stdin(loop: asyncio.AbstractEventLoop) -> AsyncIterator[str]:
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     def pump() -> None:
-        for line in sys.stdin:
-            loop.call_soon_threadsafe(queue.put_nowait, line.rstrip("\n"))
+        try:
+            for line in sys.stdin:
+                loop.call_soon_threadsafe(queue.put_nowait, line.rstrip("\n"))
+        except (ValueError, OSError):
+            pass  # stdin closed under us during shutdown
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
     # daemon=True: a thread parked in read() must never hold up process exit.

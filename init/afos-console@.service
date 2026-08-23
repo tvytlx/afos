@@ -10,7 +10,11 @@ Documentation=https://github.com/tvytlx/afos
 # Reproduced on a second boot: build/secondboot-serial.log.
 After=afosd.service
 Wants=afosd.service
+# Both, because the instance name decides which one exists: tty1 is served
+# by getty@, a serial line by serial-getty@. Naming only the first meant
+# the console and an agetty ran on the same serial line at once.
 Conflicts=getty@%i.service
+Conflicts=serial-getty@%i.service
 Before=getty.target
 # No unit on the path to the only console may ever stop trying. Without
 # this the console exhausts the default start limit while afosd is still

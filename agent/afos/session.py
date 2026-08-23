@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
+import secrets
+import shlex
 import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -20,18 +23,36 @@ if TYPE_CHECKING:  # pragma: no cover
 
 Sink = Callable[[dict[str, Any]], Awaitable[None]]
 
+# afos removes every audit surface Linux had -- there is no login, no sudo,
+# no shell history -- so this is the only record that the machine did anything.
+# It goes to stderr, which systemd routes to journald; deliberately not the
+# python3-systemd binding, because adding a dependency is a decision this
+# project has not made yet.
+audit = logging.getLogger("afos.audit")
+
 _ids = itertools.count(1)
+# Ids restarted at s1 on every afosd restart, so a frontend reconnecting with a
+# remembered id landed silently in a different conversation. The epoch makes a
+# stale id a rejection instead of a wrong answer.
+_EPOCH = secrets.token_hex(2)
 SCROLLBACK = 500
 REPLAY = 50
 
 
 class Session:
     def __init__(self, brain: Any, name: str | None = None) -> None:
-        self.id = f"s{next(_ids)}"
+        self.id = f"s{next(_ids)}.{_EPOCH}"
         self.name = name or self.id
         self.created = time.time()
         self.brain = brain
         self.registry: Registry | None = None
+        # Set by the daemon from the kernel's view of the connection, not
+        # from anything a client claimed about itself.
+        self.peer: str = "unattributed"
+        # `apt upgrade`, a filesystem check, a large copy: all of them run
+        # longer than the default and all of them are ordinary things to
+        # ask this agent to do. Adjustable per session via `:timeout`.
+        self.exec_timeout: float = shell.DEFAULT_TIMEOUT
         self.history: list[dict[str, Any]] = []
         self._sinks: set[Sink] = set()
         self._turn = asyncio.Lock()
@@ -75,8 +96,30 @@ class Session:
             except Exception:
                 self._sinks.discard(sink)
 
-    async def run_shell(self, cmd: str, timeout: float = shell.DEFAULT_TIMEOUT) -> int:
-        return await shell.run(cmd, lambda line: self.emit("exec", line), timeout=timeout)
+    async def run_shell(self, cmd: str, timeout: float | None = None) -> int:
+        timeout = self.exec_timeout if timeout is None else timeout
+        started = time.monotonic()
+        audit.info(
+            "exec start session=%s peer=%s cmd=%s",
+            self.id,
+            self.peer,
+            shlex.quote(cmd),
+        )
+        try:
+            rc = await shell.run(
+                cmd, lambda line: self.emit("exec", line), timeout=timeout
+            )
+        except asyncio.CancelledError:
+            audit.info(
+                "exec cancelled session=%s peer=%s after=%.1fs cmd=%s",
+                self.id, self.peer, time.monotonic() - started, shlex.quote(cmd),
+            )
+            raise
+        audit.info(
+            "exec end session=%s peer=%s rc=%d after=%.1fs cmd=%s",
+            self.id, self.peer, rc, time.monotonic() - started, shlex.quote(cmd),
+        )
+        return rc
 
     # -- input ---------------------------------------------------------------
     #
@@ -143,10 +186,30 @@ class Session:
             return False
 
     def interrupt(self) -> bool:
-        if self._task is not None and not self._task.done():
+        """Cancel the running turn AND discard whatever is queued behind it.
+
+        Cancelling only the current turn meant Ctrl-C on the machine's only
+        console could not stop a batch: the next queued command started
+        immediately, so the operator was interrupting one command at a time
+        while the queue kept feeding.
+        """
+        dropped = 0
+        while True:
+            try:
+                self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._inbox.task_done()
+            dropped += 1
+
+        running = self._task is not None and not self._task.done()
+        if running:
             self._task.cancel()
-            return True
-        return False
+        if dropped:
+            asyncio.create_task(
+                self.emit("system", f"discarded {dropped} queued input(s)")
+            )
+        return running or bool(dropped)
 
     def close(self) -> None:
         if self._worker is not None:

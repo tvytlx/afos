@@ -58,6 +58,29 @@ So `afos.exec` runs commands the way any other tool would be called — scoped,
 streamed, timed out, in its own process group so a timeout can actually kill
 the whole tree.
 
+## Nothing the agent produces may be able to kill it
+
+`afosd` runs for the life of the machine and is the only way into it, so "small
+leak" and "eventually a brick" are the same sentence. Three limits, all of them
+found by flooding a running daemon rather than by reading the code:
+
+- **The outbox is bounded in bytes, not frames.** A frame cap alone does not
+  close the hole it looks like it closes: frames are capped at 2 MB, so 4096 of
+  them is still 8 GB. `:exec cat /var/log/syslog` on a box with long JSON lines
+  gets there in seconds.
+- **`state` frames are never evicted, and gaps are announced in band.** busy/idle
+  is what draws the prompt, and it sits at the head of exactly the flood that
+  would evict it — leaving a console that finished working but never said so.
+  And reporting dropped output only to journald reports it only to a place you
+  need this console to read.
+- **`MemoryMax=512M` on the unit.** A bounded cgroup failure with a journal
+  entry beats the kernel picking a victim, because on this machine the OOM
+  killer and a brick are the same outcome.
+
+Sessions are reaped when no frontend can reach them, and a frame larger than the
+stated limit is refused rather than allowed to raise `ValueError` out of
+`readline()` and kill the connection.
+
 ## Input is queued
 
 Turns run one at a time, in order, from a per-session queue. The tempting
@@ -100,6 +123,17 @@ Two concrete rules follow, and both were learned the expensive way:
   a console, and gating the only interactive entry on DHCP is what dragged it
   into the failing early-boot job to begin with. A brain that needs the network
   deals with its absence at call time.
+- **The terminal reflexes must be inert.** Ctrl-Z on the console would suspend
+  it, and systemd cannot see a stopped process: the unit still reports `active`,
+  `afosd` is healthy so break-glass stays shut by design, and the machine is
+  deaf until someone power-cycles it. `SIGTSTP`, `SIGTTIN`, `SIGTTOU` and
+  `SIGQUIT` are ignored — there is nothing to suspend *to*. A getty could afford
+  to be stopped; this cannot.
+- **Nothing may leave the console's file descriptor non-blocking.** systemd
+  hands a tty unit the same open file description for stdin and stdout, so
+  `loop.connect_read_pipe()` on stdin made `stdout` non-blocking too — and the
+  first burst of output large enough to fill the tty buffer raised
+  `BlockingIOError` and exited the console. Stdin is read on a thread instead.
 
 The escalation logic behaved perfectly during that failure and made it worse:
 `afosd` was healthy, so break-glass correctly stayed shut. Correct components
@@ -159,12 +193,92 @@ more than a compact encoding.
 `bye` is graceful: the daemon drains accepted work before closing, so a script
 that submits a turn and quits still sees the output.
 
-## Socket permissions
+## Who is allowed in, honestly
 
-`/run/afos/afosd.sock` is `0660 root:afos`. A frontend needs group membership,
-not root — which is what makes an ssh `ForceCommand` frontend possible without
-handing out a root shell.
+`/run/afos/afosd.sock` is `0660 root:afos`. An earlier version of this document
+said that meant a frontend "needs group membership, not root — which is what
+makes an ssh `ForceCommand` frontend possible without handing out a root shell."
 
+**That was false, and worth stating plainly because it invited the mistake.**
+`afosd` runs as root with no `User=`, no `NoNewPrivileges=`, and `:exec` runs
+`/bin/sh -c` on an arbitrary string with no allow-list. So reaching the socket
+at all *is* root command execution: `:exec cat /etc/shadow` works. Adding an
+unprivileged operator to group `afos` gives them root while the sentence above
+told you it had not.
+
+Today nothing is exposed by it — the image creates no users and group `afos` is
+empty — but the claim is what a reader would have built on.
+
+What exists now instead:
+
+- **The peer's identity comes from the kernel.** `hello`'s `frontend` field is a
+  string the client picks; it names a frontend the way a user-agent header names
+  a browser. `SO_PEERCRED` gives the real uid/gid/pid, and that is what gets
+  logged and displayed (`console:ttyAMA0[root] attached`).
+- **There is one place an authorization decision goes.** `identity.Policy`
+  admits everyone in v0, because the socket mode is the whole boundary and a
+  second check against the same fact would be theatre. It exists so the decision
+  has a home before there is more than one frontend to make it about.
+
+## ssh is a frontend, not a way past the agent
+
+On any real cloud the default configuration made the project's central claim
+false: cloud-init writes the provider's key into `/root/.ssh/authorized_keys`
+and `ssh.socket` is active, so port 22 was a root shell that never touched
+`afosd`. Every T2 check still passed, because T2 only ever looked at the serial
+console.
+
+`ForceCommand /usr/local/bin/afos-console --wait` in `sshd_config` — chosen over
+a `command=` option in `authorized_keys` precisely because it applies to keys
+nobody in this project put there. Around it, the channels `ForceCommand` does
+not cover are closed: sftp, TCP/agent/socket forwarding, X11, tunnels,
+`PermitUserRC`.
+
+One counter-intuitive detail, because it costs an afternoon to rediscover:
+`PermitRootLogin forced-commands-only` does **not** mean "only the forced
+command". It means "only if the *key* carries a `command=` option" and ignores
+`ForceCommand` entirely; sshd's privsep monitor then kills the session with
+`fatal: monitor_child_preauth: unexpected authentication`. The correct setting
+is `prohibit-password`, with `ForceCommand` doing the constraining.
+
+The drop-in is `00-afos.conf`, not `60-`: sshd takes the *first* value it
+obtains, and cloud-init writes `50-cloud-init.conf`.
+
+T2 proves this by logging in — a plain session, a session that asks for
+`/bin/bash -i`, and an sftp attempt — rather than by reading the config back.
+Reading the config back proves the file was written, which is not the property.
+
+## Audit
+
+afos removes every audit surface Linux had — no login, no `sudo`, no shell
+history — so without something in their place the machine has no record that it
+ever did anything.
+
+Every `:exec` writes a line to `afos.audit` (stderr, which systemd routes to
+journald): the command, the session, the peer's kernel-supplied identity, the
+exit code and the duration, with a separate record if it was cancelled. It is
+deliberately not the `python3-systemd` binding, because adding a dependency is a
+decision this project has not made yet — see below.
+
+## Open question: how does code reach an afos machine?
+
+The current answer, arrived at by accident rather than decision: a base64
+tarball of pure-Python source inside a seed ISO, with no package manager
+involved. T0 and T1 `pip install`; T2 untars. That divergence is invisible until
+the first dependency is added, at which point T0 and T1 stay green and T2 boots
+into break-glass.
+
+`image/build-seed.py` now refuses to build a seed whose `pyproject.toml`
+declares dependencies, so the trap is a build error with a name on it. That is a
+guard, not an answer. The answer is a choice — vendor a wheelhouse into the seed
+and `pip install --no-index`, or build a real rootfs — and it should be made
+before wiring up a model, because a model SDK is exactly the dependency that
+springs it.
+
+There is also no way to update the agent on a running machine. Today that is
+`make reset`.
+
+## Where the model goes
 ## Where the model goes
 
 `afos/brain.py`. v0 ships a builtin-only brain on purpose: the daemon, the

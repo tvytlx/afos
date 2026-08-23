@@ -15,6 +15,13 @@ users: []
 disable_root: false
 ssh_pwauth: false
 
+# A key for root -- which is safe precisely because ForceCommand makes an
+# ssh login land in the agent console and nothing else. This is the shape a
+# real cloud already has (the provider injects its own key here), so the
+# acceptance run tests the real configuration rather than an emptier one.
+ssh_authorized_keys:
+  - @TEST_SSH_KEY@
+
 write_files:
   - path: /etc/systemd/system/afosd.service
     content: |
@@ -34,6 +41,13 @@ write_files:
   - path: /etc/systemd/logind.conf.d/afos.conf
     content: |
 @LOGIND_CONF@
+  - path: /etc/ssh/sshd_config.d/00-afos.conf
+    permissions: '0644'
+    content: |
+@SSHD_CONF@
+  - path: /opt/afos/packages.keep
+    content: |
+@PACKAGES_KEEP@
   - path: /opt/afos/packages.purge
     content: |
 @PACKAGES_PURGE@
@@ -77,23 +91,50 @@ runcmd:
   # 3. Subtract every interactive entry that is not the agent. Masked, not
   #    disabled: the difference between "not started" and "cannot be started".
   - [sh, -c, ". /run/afos-serial.env; systemctl mask getty@tty1.service getty-static.service \"serial-getty@$AFOS_SERIAL.service\""]
+  # Masking does not stop a unit that is already running, and getty.target is
+  # reached long before cloud-init gets here -- so without this the first boot
+  # really does serve a human login prompt on tty1 for the life of that boot,
+  # which is the single thing afos exists to remove. Stop every getty that got
+  # started, not just the ones this template can name.
+  - [sh, -c, "systemctl stop 'getty@*' 'serial-getty@*' 2>/dev/null || true"]
+  - [sh, -c, "pkill -f '^/sbin/agetty' 2>/dev/null || true"]
   - [sh, -c, "systemctl disable getty.target || true"]
 
   # 4. Point break-glass at the console that actually exists on this machine.
   - [sh, -c, ". /run/afos-serial.env; mkdir -p /etc/systemd/system/afos-breakglass.service.d; printf '[Service]\\nExecStart=\\nExecStart=/sbin/agetty --autologin root --noclear %s 115200 vt220\\nTTYPath=/dev/%s\\n' \"$AFOS_SERIAL\" \"$AFOS_SERIAL\" > /etc/systemd/system/afos-breakglass.service.d/console.conf"]
 
-  # 5. Install the agent as the replacement.
+  # 5. Make ssh a frontend rather than a bypass. Without this, the provider's
+  #    key in /root/.ssh/authorized_keys is a root shell on port 22 that never
+  #    touches the agent -- which would make the project's central claim false
+  #    on every real cloud, while every check in T2 still passed.
+  # /run/sshd is created by ssh.service, which socket activation means has
+  # never run yet -- so `sshd -t` fails with "Missing privilege separation
+  # directory" and the config is never validated.
+  - [sh, -c, "mkdir -p /run/sshd && sshd -t"]
+  - [sh, -c, "systemctl reload ssh 2>/dev/null || true"]
+
+  # 6. Install the agent as the replacement.
   - [systemctl, daemon-reload]
   - [systemctl, enable, afosd.service]
   - [sh, -c, ". /run/afos-serial.env; systemctl enable \"afos-console@$AFOS_SERIAL.service\" afos-console@tty1.service"]
 
-  # 6. Remove the leftovers now that provisioning is done with them.
+  # 7. Remove the leftovers now that provisioning is done with them.
   - [sh, -c, "apt-get -y purge $(grep -vE '^\\s*(#|$)' /opt/afos/packages.purge | tr '\\n' ' ') 2>/dev/null || true"]
   - [sh, -c, "apt-get -y autoremove --purge && apt-get clean"]
 
-  # 7. Hand over the console without a reboot, so the first boot shows the real
+  # The purge list says what goes; this says what must survive it. autoremove
+  # is unattended and operates on a package set the purge has already
+  # destabilised, so "nothing important was taken" needs checking, not hoping.
+  - [sh, -c, "for pkg in $(grep -vE '^\\s*(#|$)' /opt/afos/packages.keep); do dpkg -s \"$pkg\" >/dev/null 2>&1 || { echo \"afos: purge removed a required package: $pkg\" >&2; touch /run/afos-provision-failed; }; done"]
+  - [sh, -c, "/usr/local/bin/afosd --help >/dev/null 2>&1 || { echo 'afos: the agent does not run after provisioning' >&2; touch /run/afos-provision-failed; }"]
+
+  # 8. Hand over the console without a reboot, so the first boot shows the real
   #    thing rather than the second.
   - [systemctl, start, afosd.service]
   - [sh, -c, ". /run/afos-serial.env; systemctl start \"afos-console@$AFOS_SERIAL.service\""]
 
-final_message: "afos provisioned in $UPTIME seconds -- the agent owns the console now"
+  # Say what actually happened. The previous message announced success
+  # unconditionally, including on the boot where the agent could not start.
+  - [sh, -c, "if [ -e /run/afos-provision-failed ]; then echo 'afos: PROVISIONING FAILED -- see the messages above' >&2; else echo 'afos: provisioning verified'; fi"]
+
+final_message: "afos provisioning finished in $UPTIME seconds -- see 'provisioning verified' above for the verdict"

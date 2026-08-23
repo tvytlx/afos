@@ -26,6 +26,13 @@ Restart=always
 RestartSec=1
 KillMode=mixed
 TimeoutStopSec=10
+# A bounded cgroup failure with a journal entry, rather than a machine-wide
+# OOM. afosd is the only way into this box, so the difference between 'the
+# daemon died' and 'the kernel picked a victim' is the difference between a
+# restart and a brick. The in-process byte budget should make this
+# unreachable; it is here for the case where it does not.
+MemoryHigh=256M
+MemoryMax=512M
 StandardOutput=journal
 StandardError=journal
 

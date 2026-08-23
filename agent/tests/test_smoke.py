@@ -107,9 +107,6 @@ class SmokeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reply["t"], "error")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class QueueingTest(unittest.IsolatedAsyncioTestCase):
     """Turns must queue, not race -- a piped script is a first-class frontend."""
@@ -277,9 +274,58 @@ class ResourceLimitTest(unittest.IsolatedAsyncioTestCase):
                 "a session with work in flight was reaped",
             )
 
-    async def test_a_frontend_that_never_reads_cannot_grow_the_daemon(self) -> None:
-        from afos.daemon import OUTBOX_LIMIT
+    async def test_outbox_is_bounded_in_bytes_not_frames(self) -> None:
+        """The frame cap alone did not close the hole it looked like it closed.
 
+        Frames are capped at 2MB each, so 4096 of them is still 8GB --
+        `:exec cat /var/log/syslog` on a box with long JSON lines gets there in
+        seconds. This asserts the byte budget directly rather than asserting a
+        constant against a constant, which is what the previous version of this
+        test did: it passed with the fix reverted.
+        """
+        from afos.daemon import OUTBOX_BYTES, Outbox
+
+        outbox = Outbox()
+        big = "x" * 100_000
+        for _ in range(500):  # 50MB offered, into a 4MB budget
+            outbox.put({"t": "output", "stream": "exec", "text": big})
+        self.assertLessEqual(
+            outbox._bytes, OUTBOX_BYTES, "outbox grew past its byte budget"
+        )
+        self.assertGreater(outbox.dropped, 0)
+
+    async def test_the_gap_is_announced_in_band(self) -> None:
+        """Reporting lost output only to journald reports it only to a place
+        you need this console to read."""
+        from afos.daemon import Outbox
+
+        outbox = Outbox()
+        for _ in range(500):
+            outbox.put({"t": "output", "stream": "exec", "text": "y" * 100_000})
+        first = await outbox.get()
+        self.assertEqual(first.get("stream"), "error")
+        self.assertIn("output lost", str(first.get("text", "")))
+
+    async def test_state_frames_are_never_evicted(self) -> None:
+        """busy/idle is what draws the prompt, and it sits at the head of
+        exactly the flood that would evict it -- leaving a console that has
+        finished working but never says so."""
+        from afos.daemon import Outbox
+
+        outbox = Outbox()
+        outbox.put({"t": "state", "status": "busy"})
+        for _ in range(500):
+            outbox.put({"t": "output", "stream": "exec", "text": "z" * 100_000})
+        outbox.put({"t": "state", "status": "idle"})
+
+        states = [f for f, _ in outbox._frames if f.get("t") == "state"]
+        self.assertEqual(
+            [f["status"] for f in states],
+            ["busy", "idle"],
+            "a state frame was evicted; the console would never redraw its prompt",
+        )
+
+    async def test_a_frontend_that_never_reads_cannot_grow_the_daemon(self) -> None:
         async with Harness() as h:
             reader, writer, _ = await h.connect(session="new")
             writer.write(encode({"t": "input", "text": ":exec seq 1 60000"}))
@@ -288,9 +334,6 @@ class ResourceLimitTest(unittest.IsolatedAsyncioTestCase):
 
             session = [s for s in h.daemon.registry.sessions.values()][-1]
             self.assertLessEqual(len(session.history), SCROLLBACK_CAP)
-            # The queue is bounded; the slow frontend loses frames rather than
-            # taking the machine with it.
-            self.assertLessEqual(OUTBOX_LIMIT, 8192)
             writer.close()
 
     async def test_a_huge_single_output_is_truncated(self) -> None:
@@ -305,3 +348,138 @@ class ResourceLimitTest(unittest.IsolatedAsyncioTestCase):
                     "afosd emitted a frame no peer could read back",
                 )
             writer.close()
+
+
+class ShutdownTest(unittest.IsolatedAsyncioTestCase):
+    """afosd must stop when told to, with a console still attached.
+
+    Python 3.12 -- the version the shipped image runs -- changed
+    Server.wait_closed() to wait for outstanding connection handlers. A console
+    is attached for the life of the machine, so before the fix every
+    `systemctl restart afosd` hung until TimeoutStopSec expired and systemd
+    SIGKILLed the daemon. On 3.11 it passes trivially, which is the point of
+    running this suite inside the container too.
+    """
+
+    async def test_stop_returns_with_a_frontend_attached(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            daemon = Daemon(str(Path(tmp.name) / "d.sock"))
+            await daemon.start()
+            serving = asyncio.create_task(daemon.serve_forever())
+
+            reader, writer = await asyncio.open_unix_connection(
+                daemon.socket_path, limit=READ_LIMIT
+            )
+            writer.write(encode({"t": "hello", "frontend": "held", "session": None}))
+            await writer.drain()
+            await reader.readline()
+
+            serving.cancel()
+            await asyncio.wait_for(daemon.stop(), timeout=10)
+            self.assertFalse(Path(daemon.socket_path).exists())
+            writer.close()
+        finally:
+            tmp.cleanup()
+
+    async def test_stop_returns_mid_turn(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            daemon = Daemon(str(Path(tmp.name) / "d.sock"))
+            await daemon.start()
+            serving = asyncio.create_task(daemon.serve_forever())
+
+            reader, writer = await asyncio.open_unix_connection(
+                daemon.socket_path, limit=READ_LIMIT
+            )
+            writer.write(encode({"t": "hello", "frontend": "busy", "session": None}))
+            writer.write(encode({"t": "input", "text": ":exec sleep 30"}))
+            await writer.drain()
+            await asyncio.sleep(0.5)
+
+            serving.cancel()
+            await asyncio.wait_for(daemon.stop(), timeout=10)
+            writer.close()
+        finally:
+            tmp.cleanup()
+
+
+class InterruptQueueTest(unittest.IsolatedAsyncioTestCase):
+    """Ctrl-C must stop the batch, not just the command in flight.
+
+    Cancelling only the running turn meant the next queued command started
+    immediately, so an operator on the only console was interrupting one
+    command at a time while the queue kept feeding.
+    """
+
+    async def test_interrupt_discards_the_queue(self) -> None:
+        async with Harness() as h:
+            reader, writer, _ = await h.connect()
+            writer.write(encode({"t": "input", "text": ":exec sleep 30"}))
+            for n in range(3):
+                writer.write(encode({"t": "input", "text": f":exec echo queued-{n}"}))
+            await writer.drain()
+            await collect(reader, "busy", timeout=5)
+            await asyncio.sleep(0.3)
+
+            writer.write(encode({"t": "interrupt"}))
+            await writer.drain()
+            await collect(reader, "discarded", timeout=10)
+
+            writer.write(encode({"t": "input", "text": ":exec echo after-interrupt"}))
+            await writer.drain()
+            seen = await collect(reader, "after-interrupt", timeout=15)
+            texts = [str(f.get("text", "")) for f in seen]
+            self.assertFalse(
+                [t for t in texts if t.startswith("queued-")],
+                f"queued commands survived the interrupt: {texts}",
+            )
+            writer.close()
+
+
+class SessionIdTest(unittest.IsolatedAsyncioTestCase):
+    async def test_ids_do_not_repeat_across_daemon_restarts(self) -> None:
+        """Ids restarted at s1 every time, so a frontend reconnecting with a
+        remembered id landed silently in a different conversation."""
+        seen = []
+        for _ in range(2):
+            async with Harness() as h:
+                _, writer, hello = await h.connect(session="new")
+                seen.append(hello["session"])
+                writer.close()
+        self.assertNotEqual(seen[0], seen[1])
+
+
+class TimeoutTest(unittest.IsolatedAsyncioTestCase):
+    async def test_the_exec_timeout_can_be_raised(self) -> None:
+        """`apt upgrade` outlives 120s, and it is an ordinary thing to ask this
+        agent to do."""
+        async with Harness() as h:
+            reader, writer, _ = await h.connect()
+            writer.write(encode({"t": "input", "text": ":timeout 600"}))
+            await writer.drain()
+            await collect(reader, "timeout set to 600s", timeout=10)
+
+            session = h.daemon.registry.default
+            self.assertEqual(session.exec_timeout, 600.0)
+            writer.close()
+
+    async def test_a_command_that_overruns_is_killed_and_reported(self) -> None:
+        async with Harness() as h:
+            reader, writer, _ = await h.connect()
+            writer.write(encode({"t": "input", "text": ":timeout 1"}))
+            await writer.drain()
+            await collect(reader, "timeout set to 1s", timeout=10)
+
+            writer.write(encode({"t": "input", "text": ":exec sleep 20"}))
+            await writer.drain()
+            frames = await collect(reader, "exit 124", timeout=20)
+            self.assertTrue(
+                any("killed after" in str(f.get("text", "")) for f in frames),
+                "a killed command must say so, not just return a code",
+            )
+            writer.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

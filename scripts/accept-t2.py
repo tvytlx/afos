@@ -35,6 +35,10 @@ LOGIN_PROMPT = re.compile(rb"(?m)^\s*\S+ login:|^Password:", re.IGNORECASE)
 # login)". It contains "login:" but asks for nothing -- it is break-glass
 # working as designed, and matching it would fail the very check it satisfies.
 AUTOLOGIN = re.compile(rb"(?m)^.*login: \S+ \(automatic login\).*$")
+VALUE = re.compile(rb"AFOSV<([^>]*)>AFOSEND")
+# The console colours its output and wraps at the terminal width, so the
+# value comes back with escape sequences and line breaks inside it.
+ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def asks_for_credentials(data: bytes) -> bool:
@@ -77,6 +81,57 @@ class Machine:
                     sys.stderr.flush()
         consumed = bytes(self.buf[start:])
         return consumed
+
+    @staticmethod
+    def _sentinel(cmd: str) -> str:
+        """Wrap a command so its output comes back exactly, and only its output.
+
+        Matching a substring against everything the console printed made checks
+        unfalsifiable: the window always ends in "exit 0", so every check whose
+        expected value was "0" passed no matter what the machine answered. Two
+        of the checks backing "every other way in is gone" were in that state.
+
+        BOTH markers are split ('AFO''SV', 'AFOSE''ND') because the serial tty
+        echoes the line as it is typed. Splitting only the first one still let
+        the echo satisfy the *expect* marker, so every read stopped at the echo
+        and every check reported "<no value>" -- a harness fault that looks
+        exactly like a dead machine.
+
+        The command is wrapped in a brace group so that redirection and the
+        pipe apply to all of it: without that, `a || b` bound them to `b` alone
+        and compound checks returned two concatenated answers.
+        """
+        return (
+            "printf 'AFO''SV<%s>AFOSE''ND\\n' "
+            f""""$({{ {cmd} ; }} 2>/dev/null | tr '\\n' ',')" """
+        )
+
+    def value(self, cmd: str) -> str:
+        """Exact output of a command, run through the agent console."""
+        out = self.ask(f":exec {self._sentinel(cmd)}", "AFOSEND")
+        # Consume through the next prompt. Leaving the turn's trailing "exit 0"
+        # in the buffer made the *following* check match it and report the
+        # previous command's answer -- an off-by-one that reads exactly like a
+        # broken machine.
+        self.expect(b"afos>", 30.0)
+        return self._extract(out)
+
+    def raw_value(self, cmd: str) -> str:
+        """Exact output of a command, run through a plain shell.
+
+        Used after break-glass, when there is no agent left to ask.
+        """
+        return self._extract(self.ask(self._sentinel(cmd), "AFOSEND"))
+
+    @staticmethod
+    def _extract(out: bytes) -> str:
+        clean = ANSI.sub(b"", out).replace(b"\r", b"")
+        hit = VALUE.search(clean)
+        if not hit:
+            return "<no value>"
+        # tr turned the trailing newline into a separator; line wrapping may
+        # have split the value across rows.
+        return hit.group(1).decode("utf-8", "replace").replace("\n", "").strip().rstrip(",")
 
     def ask(self, line: str, marker: str, soft: bool = False) -> bytes:
         """Send a line to the agent and read until its marker comes back.
@@ -121,6 +176,12 @@ class Report:
             if detail:
                 print("\n".join("         " + l for l in detail.strip().splitlines()[-8:]))
 
+    def check_eq(self, desc: str, got: str, want: str) -> None:
+        """Equality, always. Substring scoring is how three of these checks
+        became incapable of failing -- and how one of them scored `"active" in
+        "inactive"` as a pass."""
+        self.check(desc, got == want, f"expected {want!r}, machine answered {got!r}")
+
     def verdict(self) -> int:
         print(f"\n  {self.passed} passed, {self.failed} failed\n")
         return 1 if self.failed else 0
@@ -156,39 +217,140 @@ def main() -> int:
         r.check("a command submitted over serial runs and answers", b"t2-alive" in out, out.decode(errors="replace"))
 
         r.section("every other way in is gone")
-        # serial-getty is instance-named after the console device, which is
-        # arch-dependent -- so ask the machine which one it has rather than
-        # asserting against the one this laptop happens to boot.
+        # Every value here is compared for equality against sentinel-delimited
+        # output. serial-getty is instance-named after the console device, which
+        # is arch-dependent, so the machine is asked which one it has rather
+        # than asserted against the one this laptop happens to boot.
         checks = [
-            ("getty@tty1 is masked", "systemctl is-enabled getty@tty1.service", b"masked"),
+            ("getty@tty1 is masked",
+             "systemctl is-enabled getty@tty1.service", "masked"),
+            ("getty@tty1 is not merely masked but STOPPED",
+             "systemctl is-active getty@tty1.service", "inactive"),
             ("the serial getty is masked",
              "systemctl is-enabled serial-getty@$(awk 'NR==1{print $1}' /proc/consoles).service",
-             b"masked"),
+             "masked"),
             ("no getty instance is running on any terminal",
              "systemctl list-units --state=active --no-legend 'getty@*' 'serial-getty@*' | wc -l",
-             b"0"),
+             "0"),
+            ("no agetty process is alive anywhere", "pgrep -c agetty || true", "0"),
             ("no user account exists besides root",
-             "awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd | wc -l", b"0"),
-            ("ssh password auth is off",
-             "sshd -T 2>/dev/null | grep -c '^passwordauthentication no' || echo 0", b"1"),
-            ("the agent shipped without pip or setuptools",
-             "command -v pip3 >/dev/null && echo present || echo absent", b"absent"),
+             "awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd | wc -l", "0"),
+            ("the agent shipped without pip",
+             "command -v pip3 >/dev/null && echo present || echo absent", "absent"),
         ]
         for desc, cmd, want in checks:
-            out = m.ask(f":exec {cmd}", "exit ")
-            r.check(desc, want in out, out.decode(errors="replace"))
+            r.check_eq(desc, m.value(cmd), want)
+
+        # ssh is the entry point afos claims not to have. Assert the absence of
+        # every way in, not just one setting -- password auth off means nothing
+        # if a provider key or root login is what actually lets someone in.
+        for desc, cmd, want in [
+            ("ssh password authentication is off",
+             "mkdir -p /run/sshd; /usr/sbin/sshd -T | awk '/^passwordauthentication /{print $2; f=1} "
+             "END{if(!f) print \"no-sshd\"}'", "no"),
+            ("root has no usable password",
+             "passwd -S root | awk '{print $2}'", "L"),
+            # ssh is a frontend now, not a bypass. Assert every lever that
+            # would turn it back into one -- ForceCommand alone is not a
+            # boundary if sftp, tunnels or agent forwarding still work.
+            ("ssh forces the agent console and nothing else",
+             "mkdir -p /run/sshd; /usr/sbin/sshd -T | awk '/^forcecommand /{print $2}'",
+             "/usr/local/bin/afos-console"),
+            # sshd -T prints the legacy synonym `without-password` for what
+            # sshd_config calls `prohibit-password`; normalise rather than
+            # hardcode whichever spelling this version happens to emit.
+            ("root ssh login is key-only",
+             "mkdir -p /run/sshd; /usr/sbin/sshd -T | awk '/^permitrootlogin /{print $2}'"
+             " | sed 's/without-password/prohibit-password/'",
+             "prohibit-password"),
+            ("ssh cannot become a file transfer",
+             "mkdir -p /run/sshd; /usr/sbin/sshd -T | awk '/^subsystem /{print $3}'", "/bin/false"),
+            ("ssh cannot become a tunnel",
+             "mkdir -p /run/sshd; /usr/sbin/sshd -T | awk '/^allowtcpforwarding /{print $2}'", "no"),
+        ]:
+            r.check_eq(desc, m.value(cmd), want)
+
+        # Reported, not asserted: afos has not yet decided whether sshd should
+        # be present at all. A check that always passes is worse than a note.
+        print(f"{DIM}  note  ssh.service/ssh.socket state: "
+              f"{m.value('systemctl is-active ssh.service ssh.socket')}{OFF}")
 
         r.section("break-glass is present but shut")
-        out = m.ask(":exec systemctl is-active afos-breakglass.service || true", "exit ")
-        r.check("break-glass is NOT running on a healthy boot", b"inactive" in out, out.decode(errors="replace"))
-        out = m.ask(":exec systemctl cat afos-rescue.target >/dev/null && echo installed", "exit 0")
-        r.check("afos-rescue.target is installed and reachable", b"installed" in out, out.decode(errors="replace"))
+        for desc, cmd, want in [
+            ("break-glass is NOT running on a healthy boot",
+             "systemctl is-active afos-breakglass.service", "inactive"),
+            ("afos-rescue.target is installed and reachable",
+             "systemctl cat afos-rescue.target >/dev/null && echo installed", "installed"),
+        ]:
+            r.check_eq(desc, m.value(cmd), want)
 
         r.section("systemd, not the agent, is PID 1")
-        out = m.ask(":exec cat /proc/1/comm", "exit 0")
-        r.check("PID 1 is systemd", b"systemd" in out, out.decode(errors="replace"))
-        out = m.ask(":exec systemctl is-active afosd.service", "exit 0")
-        r.check("afosd runs as a supervised unit", b"active" in out, out.decode(errors="replace"))
+        for desc, cmd, want in [
+            ("PID 1 is systemd", "cat /proc/1/comm", "systemd"),
+            ("afosd runs as a supervised unit", "systemctl is-active afosd.service", "active"),
+        ]:
+            r.check_eq(desc, m.value(cmd), want)
+
+        # Reading sshd's config back proves the file was written. It does not
+        # prove that a login lands in the agent rather than a shell, and that
+        # distinction is the whole difference between ssh as a frontend and ssh
+        # as a bypass -- so actually log in.
+        r.section("an ssh login lands in the agent, not a shell")
+        key = build / "afos_test_id"
+        ssh = [
+            "ssh", "-p", "2222", "-i", str(key),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            "root@localhost",
+        ]
+        try:
+            # No command: a plain interactive login.
+            plain = subprocess.run(ssh, input=":who\n:quit\n", capture_output=True,
+                                   text=True, timeout=90).stdout
+            r.check("a plain ssh login reaches the afos console",
+                    "afos" in plain and "session" in plain, plain[-400:])
+
+            # With a command: ForceCommand must win. If this lands in a shell,
+            # ssh is a root bypass no matter what the console does.
+            forced = subprocess.run(ssh + ["/bin/bash -i"], input=":who\n:quit\n",
+                                    capture_output=True, text=True, timeout=90).stdout
+            r.check("ssh cannot override the forced command with its own",
+                    "afos" in forced and "session" in forced, forced[-400:])
+
+            # sftp is a second channel that ForceCommand does not cover.
+            sftp = subprocess.run(
+                ["sftp", "-P", "2222", "-i", str(key),
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "UserKnownHostsFile=/dev/null",
+                 "-o", "BatchMode=yes", "root@localhost"],
+                input="ls\nquit\n", capture_output=True, text=True, timeout=90)
+            r.check("sftp is refused", sftp.returncode != 0,
+                    f"sftp exited {sftp.returncode}: {sftp.stdout[-200:]}")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            r.check("an ssh login reaches the afos console", False, str(e))
+
+        # No tier could see this one: T0 and T1 drive the console through a
+        # pipe, and T2 drove it through qemu's stdio without ever sending the
+        # byte a human at a terminal would eventually send. A suspended console
+        # is invisible to systemd -- Restart= cannot see a stopped process, the
+        # unit still reports active, afosd is healthy so break-glass stays shut,
+        # and the machine is deaf until someone power-cycles it.
+        r.section("the console survives the keys a human will actually press")
+        for name, keys in [("Ctrl-Z", b"\x1a"), ("Ctrl-\\", b"\x1c")]:
+            assert m.proc.stdin is not None
+            m.proc.stdin.write(keys)
+            m.proc.stdin.flush()
+            try:
+                r.check_eq(
+                    f"the console still answers after {name}",
+                    m.value("echo alive"),
+                    "alive",
+                )
+            except TimeoutError:
+                r.check(f"the console still answers after {name}", False,
+                        f"the console stopped responding after {name}")
 
         # The gap that let a bricking bug ship: every check above runs on the
         # FIRST boot, where cloud-init hand-starts the console at the end of
@@ -209,9 +371,15 @@ def main() -> int:
                 bytes(m.buf[-2000:]).decode("utf-8", "replace"),
             )
             m.expect(b"afos>", 60.0)
-            out = m.ask(":exec systemctl is-active afosd.service", "exit 0")
-            r.check("afosd is active on the second boot", b"active" in out,
-                    out.decode(errors="replace"))
+            got = "<no value>"
+            for _ in range(6):
+                try:
+                    got = m.value("systemctl is-active afosd.service")
+                except TimeoutError:
+                    continue
+                if got != "<no value>":
+                    break
+            r.check_eq("afosd is active on the second boot", got, "active")
         except TimeoutError:
             r.check("the agent owns the console after a reboot", False,
                     bytes(m.buf[-2500:]).decode("utf-8", "replace"))
@@ -242,10 +410,17 @@ def main() -> int:
                 not asks_for_credentials(window),
                 "a login prompt appeared -- break-glass should not ask for credentials",
             )
-            r.check(
-                "the agent console gave up the line",
-                b"afos>" not in window.split(b"root@afos")[-1],
-                "the agent is still prompting after the machine surrendered",
+            # Name the actual unit and compare for equality. The previous
+            # two forms both could not fail: one sliced the window after the
+            # root prompt, the other globbed a pattern that matches nothing
+            # and then scored `"active" in "inactive"` as a pass.
+            r.check_eq(
+                "the agent console unit is stopped, not merely quiet",
+                m.raw_value(
+                    "systemctl is-active "
+                    "afos-console@$(awk 'NR==1{print $1}' /proc/consoles).service"
+                ),
+                "inactive",
             )
         except TimeoutError:
             r.check("break-glass handed a root shell to the serial console", False,

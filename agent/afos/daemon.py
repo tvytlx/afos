@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import grp
 import logging
 import os
 import signal
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import identity
 from .brain import BuiltinBrain
 from .protocol import READ_LIMIT, SOCKET_PATH, ProtocolError, decode, encode
 from .session import Session
@@ -27,17 +30,91 @@ log = logging.getLogger("afosd")
 SOCKET_GROUP = "afos"  # non-root frontends (sshd ForceCommand) join via this group
 SOCKET_MODE = 0o660
 BYE_DRAIN_SECONDS = 30.0
+FLUSH_SECONDS = 5.0
 
 # A frontend that stops reading must not be able to grow afosd without bound.
 # `:exec seq 1 400000` against a non-reading frontend took the daemon from 24MB
 # to 126MB and climbing; on a machine whose only entry point is this process,
-# the OOM killer is indistinguishable from a brick. When the queue fills, the
-# slow frontend loses frames -- it does not get to take the machine with it.
-OUTBOX_LIMIT = 4096
+# the OOM killer is indistinguishable from a brick.
+#
+# The budget is in BYTES, not frames. A frame cap alone does not close the hole
+# it looks like it closes: frames are capped at 2MB each, so 4096 of them is
+# still 8GB. `:exec cat /var/log/syslog` on a box with long JSON lines gets
+# there in seconds.
+OUTBOX_BYTES = 4 * 1024 * 1024
+OUTBOX_HIGH_WATER = OUTBOX_BYTES // 2
+CLOSE_TIMEOUT = 5.0
 
 
 class _Goodbye(Exception):
     """A frontend detaching on purpose -- not a fault, so not logged as one."""
+
+
+class Outbox:
+    """Frames waiting to reach one frontend, bounded by total encoded size.
+
+    Two rules that a plain Queue does not give you, and that matter because the
+    frontend on the other end may be the machine's only console:
+
+    - `state` frames are never evicted. The busy/idle pair is what draws the
+      prompt, and it is the frame most likely to be at the head of a flood --
+      losing it leaves a console that has finished working but never says so.
+    - A gap is announced in band. Reporting dropped output only to journald
+      means reporting it only to a place you need this console to read.
+    """
+
+    def __init__(self, max_bytes: int = OUTBOX_BYTES) -> None:
+        self.max_bytes = max_bytes
+        self._frames: deque[tuple[dict[str, Any], int]] = deque()
+        self._bytes = 0
+        self._wake = asyncio.Event()
+        self.dropped = 0
+        self._announced = 0
+
+    def put(self, frame: dict[str, Any]) -> None:
+        size = len(encode(frame))
+        self._frames.append((frame, size))
+        self._bytes += size
+        while self._bytes > self.max_bytes and len(self._frames) > 1:
+            self._evict_oldest()
+        self._wake.set()
+
+    def _evict_oldest(self) -> None:
+        for i, (frame, size) in enumerate(self._frames):
+            if frame.get("t") == "state":
+                continue
+            del self._frames[i]
+            self._bytes -= size
+            self.dropped += 1
+            return
+        frame, size = self._frames.popleft()  # all state frames: shed anyway
+        self._bytes -= size
+        self.dropped += 1
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._frames) or self.dropped > self._announced
+
+    @property
+    def pressured(self) -> bool:
+        return self._bytes > OUTBOX_HIGH_WATER
+
+    async def get(self) -> dict[str, Any]:
+        while True:
+            if self.dropped > self._announced:
+                lost = self.dropped - self._announced
+                self._announced = self.dropped
+                return {
+                    "t": "output",
+                    "stream": "error",
+                    "text": f"[afos] output lost -- {lost} frame(s) dropped here",
+                }
+            if self._frames:
+                frame, size = self._frames.popleft()
+                self._bytes -= size
+                return frame
+            self._wake.clear()
+            await self._wake.wait()
 
 
 class Registry:
@@ -89,7 +166,9 @@ class Daemon:
     def __init__(self, socket_path: str = SOCKET_PATH) -> None:
         self.socket_path = socket_path
         self.registry = Registry(BuiltinBrain())
+        self.policy = identity.Policy()
         self._server: asyncio.AbstractServer | None = None
+        self._handlers: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         path = Path(self.socket_path)
@@ -112,7 +191,19 @@ class Daemon:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
+            # Python 3.12 changed Server.wait_closed() to wait for outstanding
+            # connection handlers before returning. On this machine a console is
+            # attached for the life of the box, so the wait never ends: every
+            # `systemctl restart afosd` would hang until TimeoutStopSec expired
+            # and systemd SIGKILLed us. On 3.11 wait_closed() returned at once,
+            # which is why it took running the tests on the Python the image
+            # actually ships (3.12) to see it at all.
+            for task in list(self._handlers):
+                task.cancel()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), CLOSE_TIMEOUT)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                log.warning("connection handlers did not settle; closing anyway")
         Path(self.socket_path).unlink(missing_ok=True)
 
     # -- connection handling -------------------------------------------------
@@ -120,27 +211,24 @@ class Daemon:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        outbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue(OUTBOX_LIMIT)
+        handler = asyncio.current_task()
+        if handler is not None:
+            self._handlers.add(handler)
+
+        outbox = Outbox()
         session: Session | None = None
         pump: asyncio.Task[None] | None = None
         frontend = "unknown"
-        dropped = 0
 
         async def sink(frame: dict[str, Any]) -> None:
-            nonlocal dropped
-            try:
-                outbox.put_nowait(frame)
-            except asyncio.QueueFull:
-                # Drop the oldest rather than the newest: on a console, the
-                # most recent output is the part still worth reading.
-                try:
-                    outbox.get_nowait()
-                    outbox.put_nowait(frame)
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
-                if not dropped:
-                    log.warning("frontend %s is not keeping up; dropping frames", frontend)
-                dropped += 1
+            before = outbox.dropped
+            outbox.put(frame)
+            if outbox.dropped and not before:
+                log.warning("frontend %s is not keeping up; dropping frames", frontend)
+            if outbox.pressured:
+                # Cooperative backpressure: yield so the writer task gets a
+                # chance to drain the socket before the producer runs again.
+                await asyncio.sleep(0)
 
         try:
             line = await reader.readline()
@@ -152,7 +240,18 @@ class Daemon:
                 await writer.drain()
                 return
 
-            frontend = str(hello.get("frontend", "unknown"))
+            # The kernel's answer, not the client's. `hello.frontend` is a
+            # label the client chose; it is fine for a log line and worthless
+            # for a decision, so it is clamped and clearly subordinate.
+            peer = identity.of(writer)
+            claimed = str(hello.get("frontend", "unknown"))[:64]
+            frontend = f"{claimed}[{self.policy.describe(peer)}]"
+
+            allowed, why = self.policy.admits(peer)
+            if not allowed:
+                writer.write(encode({"t": "error", "text": f"refused: {why}"}))
+                await writer.drain()
+                return
             try:
                 session = self.registry.resolve(hello.get("session"))
             except KeyError as e:
@@ -174,6 +273,7 @@ class Daemon:
             )
             await writer.drain()
 
+            session.peer = str(peer)
             pump = asyncio.create_task(self._pump(outbox, writer))
             await session.attach(sink)
             log.info("%s attached to %s", frontend, session.id)
@@ -202,20 +302,29 @@ class Daemon:
             pass
         except (ProtocolError, ConnectionResetError) as e:
             log.warning("frontend %s: %s", frontend, e)
+        except asyncio.CancelledError:
+            pass  # afosd is shutting down; teardown below still runs
         finally:
+            if handler is not None:
+                self._handlers.discard(handler)
             if session is not None:
                 session.detach(sink)
-                await session.emit("system", f"{frontend} detached")
+                try:
+                    await session.emit("system", f"{frontend} detached")
+                except asyncio.CancelledError:
+                    pass
                 reaped = self.registry.reap()
                 if reaped:
                     log.info("reaped %d unreachable session(s)", reaped)
-            if dropped:
+            if outbox.dropped:
                 # One line per connection, not one per burst: journald is read
                 # through the agent on this machine, and a flood of warnings
                 # about a flood is its own denial of service.
-                log.warning("frontend %s lost %d frame(s) in total", frontend, dropped)
+                log.warning(
+                    "frontend %s lost %d frame(s) in total", frontend, outbox.dropped
+                )
             if pump is not None:
-                pump.cancel()
+                await self._flush(outbox, pump, writer)
             writer.close()
 
     async def _dispatch(self, session: Session, msg: dict[str, Any]) -> None:
@@ -227,16 +336,33 @@ class Daemon:
                 await session.emit("system", "nothing to interrupt")
         elif kind == "bye":
             # Graceful: let accepted work finish and reach this frontend before
-            # the socket goes away.
+            # the socket goes away. Draining the session is only half of it --
+            # the frames are then sitting in this connection's outbox, and
+            # cancelling the writer task would throw away exactly the output
+            # drain() just waited for.
             await session.drain(timeout=BYE_DRAIN_SECONDS)
             raise _Goodbye
         else:
             await session.emit("error", f"unknown frame type: {kind!r}")
 
     @staticmethod
-    async def _pump(
-        outbox: asyncio.Queue[dict[str, Any]], writer: asyncio.StreamWriter
+    async def _flush(
+        outbox: "Outbox", pump: asyncio.Task[None], writer: asyncio.StreamWriter
     ) -> None:
+        """Give the writer a bounded chance to empty the outbox before closing.
+
+        Without this, `:quit` after a slow command produced no output at all --
+        the session drained, and then the frames died in the queue.
+        """
+        deadline = asyncio.get_running_loop().time() + FLUSH_SECONDS
+        while outbox.pending and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        pump.cancel()
+        with contextlib.suppress(Exception):
+            await writer.drain()
+
+    @staticmethod
+    async def _pump(outbox: "Outbox", writer: asyncio.StreamWriter) -> None:
         try:
             while True:
                 writer.write(encode(await outbox.get()))

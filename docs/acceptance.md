@@ -7,11 +7,11 @@ problem tells you less than one that shows all of them.
 ```bash
 make accept-t0     # ~40s   13 checks
 make accept-t1     # ~3min  18 checks   (creates an OrbStack machine)
-make accept-t2     # ~6min  20 checks   (downloads 618MB once, then boots QEMU twice)
+make accept-t2     # ~7min  32 checks   (downloads 618MB once, then boots QEMU twice)
 make accept        # all three, fast to slow
 ```
 
-Last full run: **T0 13/13 · T1 18/18 · T2 20/20.**
+Last full run: **T0 13/13 · T1 18/18 · T2 32/32.**
 
 ## What each tier can and cannot prove
 
@@ -37,7 +37,11 @@ Runs inside the dev container.
   an immediate `:quit` without truncation
 - **the userspace afosd ships in** — python3 present, `/bin/sh` present (the
   shell is demoted, not deleted), no display manager
-- **the full suite** — 9 unit and protocol tests
+- **the full suite** — 25 unit and protocol tests, run on the container's
+  Python 3.12 as well as the host's 3.11. That is not redundancy: 3.12
+  changed `Server.wait_closed()` to wait for outstanding handlers, and a
+  console is attached for the life of the machine — so `systemctl restart
+  afosd` hung until systemd SIGKILLed it, invisibly, on 3.11-only testing.
 
 A container has no boot, no tty1 and no display manager to remove. Passing T0
 says the agent works; it says nothing about whether afos boots.
@@ -93,10 +97,33 @@ by definition the working interactive entry, and the serial transcript
   as the last step of provisioning and so guarantees the property by side
   effect. A machine that only works the first time it is switched on is not
   an OS.
+- **an ssh login lands in the agent, not a shell** — by actually logging in:
+  a plain session, a session that asks for `/bin/bash -i`, and an sftp attempt.
+  Reading sshd's config back proves the file was written, which is not the
+  property
+- **the console survives the keys a human will actually press** — Ctrl-Z and
+  Ctrl-\\ on the serial line, then the prompt must still answer. No tier could
+  see this before: T0 and T1 drive the console through a pipe, and T2 drove it
+  through qemu's stdio without ever sending those bytes
 - **exhausting the restart limit surrenders the machine** — a kill storm drives
   afosd past its restart limit; break-glass hands a root shell to the serial
   console, by autologin rather than a credential prompt, and the agent console
-  gives up the line
+  unit is stopped
+
+## Checks that could not fail
+
+Three T2 checks were scored by substring match against a window that always
+ends in `exit 0`, so every check whose expected value was `0` passed no matter
+what the machine answered — including both checks backing "every other way in
+is gone". One scored `"active" in "inactive"` as a pass.
+
+Values now come back between sentinels and are compared with `==`, through
+`Report.check_eq`, so that shape cannot be written again. Both sentinel halves
+are split (`AFO''SV`, `AFOSE''ND`) because the serial tty echoes the line as it
+is typed — splitting only the first still let the echo satisfy the read.
+
+When those checks became honest they immediately failed, which is how the
+running getty on tty1 and the ssh bypass were found.
 
 ## Verifying by hand
 
