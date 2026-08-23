@@ -18,6 +18,7 @@ afos v0 -- no model wired up yet. Builtins:
   :help              this
   :exec <cmd>        run a shell command (shell is a capability, not an entry)
   :timeout [secs]    show or set this session's command timeout
+  :update <tarball>  install a new agent, atomically, with rollback
   :sessions          list sessions in this daemon
   :who               this session and its attached frontends
   :quit              detach this frontend (the session keeps running)
@@ -66,6 +67,25 @@ class BuiltinBrain:
                 return
             session.exec_timeout = seconds
             await session.emit("system", f"timeout set to {seconds:.0f}s")
+
+        elif cmd == "update":
+            if not arg:
+                await session.emit("error", "usage: :update <tarball>")
+                return
+            # systemd-run, because the update restarts afosd -- and anything the
+            # agent spawns lives in afosd's cgroup, which KillMode=mixed takes
+            # down with it. An updater that dies halfway through its own restart
+            # is how a machine ends up pointing at a version that never loaded.
+            rc = await session.run_shell(
+                f"systemd-run --collect --unit=afos-update --wait --pipe "
+                f"/usr/local/bin/afos-update {arg}",
+                timeout=300,
+            )
+            await session.emit(
+                "system",
+                "update applied" if rc == 0 else f"update failed (exit {rc}); "
+                "the agent you are talking to is the one that was already running",
+            )
 
         elif cmd == "sessions":
             reg = session.registry

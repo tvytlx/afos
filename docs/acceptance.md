@@ -7,11 +7,11 @@ problem tells you less than one that shows all of them.
 ```bash
 make accept-t0     # ~40s   13 checks
 make accept-t1     # ~3min  18 checks   (creates an OrbStack machine)
-make accept-t2     # ~7min  32 checks   (downloads 618MB once, then boots QEMU twice)
+make accept-t2     # ~9min  42 checks   (downloads 618MB once, then boots QEMU twice)
 make accept        # all three, fast to slow
 ```
 
-Last full run: **T0 13/13 · T1 18/18 · T2 32/32.**
+Last full run: **T0 13/13 · T1 18/18 · T2 42/42.**
 
 ## What each tier can and cannot prove
 
@@ -22,7 +22,7 @@ the tier below is structurally blind to, and none of them is redundant.
 |---|---|---|---|
 | **T0** | container | agent logic, wire protocol, shell capability | anything about boot, tty, or init |
 | **T1** | live systemd, no boot | units, restart policy, escalation decision | boot; and not the isolate itself (see below) |
-| **T2** | real boot in QEMU | the agent owns the console and nothing else does, on the first boot *and* after a reboot | — this is the gate |
+| **T2** | real boot in QEMU | the agent owns the console and nothing else does — on the first boot, after a reboot, over ssh, and after replacing itself | — this is the gate |
 
 ## T0 — `make accept-t0`
 
@@ -97,6 +97,14 @@ by definition the working interactive entry, and the serial transcript
   as the last step of provisioning and so guarantees the property by side
   effect. A machine that only works the first time it is switched on is not
   an OS.
+- **the agent and everything vendored with it imports** — dependencies are
+  resolved on the build host for the target platform; whether they import *on
+  the machine* is a separate claim, and a macOS wheel imports fine on the laptop
+  that built it
+- **the agent can be replaced on a running machine** — a good version installs,
+  the console comes back on it, and the running agent reports the new version; a
+  version with a deliberate `ImportError` is refused, the machine is left on the
+  old one, and the refusal is on the record
 - **an ssh login lands in the agent, not a shell** — by actually logging in:
   a plain session, a session that asks for `/bin/bash -i`, and an sftp attempt.
   Reading sshd's config back proves the file was written, which is not the

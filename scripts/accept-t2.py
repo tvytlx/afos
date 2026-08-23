@@ -35,6 +35,10 @@ LOGIN_PROMPT = re.compile(rb"(?m)^\s*\S+ login:|^Password:", re.IGNORECASE)
 # login)". It contains "login:" but asks for nothing -- it is break-glass
 # working as designed, and matching it would fail the very check it satisfies.
 AUTOLOGIN = re.compile(rb"(?m)^.*login: \S+ \(automatic login\).*$")
+# Not the version: matching it turns the gate into a silent 15-minute hang
+# the first time anyone bumps __version__, and the update section bumps it
+# on purpose.
+BANNER = b" -- session "
 VALUE = re.compile(rb"AFOSV<([^>]*)>AFOSEND")
 # The console colours its output and wraps at the terminal width, so the
 # value comes back with escape sequences and line breaks inside it.
@@ -123,6 +127,22 @@ class Machine:
         """
         return self._extract(self.ask(self._sentinel(cmd), "AFOSEND"))
 
+    def resync(self, tries: int = 20) -> bool:
+        """Re-establish the request/response rhythm after afosd restarts.
+
+        An update takes the console's connection down mid-turn: the turn's
+        trailing "exit 0" never arrives, the console reconnects and prints a
+        fresh banner, and anything waiting for the old prompt waits forever.
+        Polling until the console answers again is the honest way back in sync.
+        """
+        for _ in range(tries):
+            try:
+                if self.value("echo resync") == "resync":
+                    return True
+            except (TimeoutError, RuntimeError):
+                continue
+        return False
+
     @staticmethod
     def _extract(out: bytes) -> str:
         clean = ANSI.sub(b"", out).replace(b"\r", b"")
@@ -203,7 +223,7 @@ def main() -> int:
     m = Machine(transcript)
     try:
         r.section("it boots, and the agent takes the console")
-        boot = m.expect(b"afos 0.0.1 -- session", BOOT_TIMEOUT, echo=args.verbose)
+        boot = m.expect(BANNER, BOOT_TIMEOUT, echo=args.verbose)
         r.check("the machine boots and afos-console owns the serial line", True)
         r.check(
             "no login prompt ever appeared on the console",
@@ -224,6 +244,13 @@ def main() -> int:
         checks = [
             ("getty@tty1 is masked",
              "systemctl is-enabled getty@tty1.service", "masked"),
+            # The instance nobody named. Masking getty@tty1 alone left this one
+            # free, and logind autospawns it on Ctrl-Alt-F2.
+            ("an unnamed getty instance is masked too",
+             "systemctl is-enabled getty@tty7.service", "masked"),
+            ("logind autospawns no virtual terminals on THIS boot",
+             "systemd-analyze cat-config systemd/logind.conf | grep -c '^NAutoVTs=0'",
+             "1"),
             ("getty@tty1 is not merely masked but STOPPED",
              "systemctl is-active getty@tty1.service", "inactive"),
             ("the serial getty is masked",
@@ -331,6 +358,66 @@ def main() -> int:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
             r.check("an ssh login reaches the afos console", False, str(e))
 
+        # Vendored dependencies are resolved on the build host for the
+        # target platform and unpacked into the lib directory. Whether they
+        # actually import on the machine is a different claim -- a macOS wheel
+        # imports fine on the laptop that built it.
+        r.section("the agent and everything vendored with it imports")
+        r.check_eq(
+            "afos imports from the versioned lib directory",
+            m.value("python3 -c \"import sys; sys.path.insert(0,'/opt/afos/lib');"
+                    " import afos; print(afos.__version__)\""),
+            "0.0.1",
+        )
+        vendored = m.value("cat /opt/afos/lib/VENDORED | head -1")
+        print(f"{DIM}  note  vendored: {vendored}{OFF}")
+        # One line, not a heredoc: every line typed at the console is its own
+        # turn, so a multi-line command arrives as several unrelated inputs.
+        r.check_eq(
+            "every vendored package imports on the machine",
+            m.value(
+                "ok=1; for d in /opt/afos/lib/*/; do n=$(basename $d); "
+                "case $n in *.dist-info|*.data) continue;; esac; "
+                "PYTHONPATH=/opt/afos/lib python3 -c \"import $n\" 2>/dev/null "
+                "|| { ok=0; echo bad:$n; }; done; "
+                "[ $ok = 1 ] && echo all-import"
+            ),
+            "all-import",
+        )
+
+        # An OS has to answer "how does new software get here". afos's answer
+        # was "it doesn't" -- the code arrived frozen in the seed ISO. These two
+        # checks are the answer and its safety net, in that order.
+        r.section("the agent can be replaced on a running machine")
+        version = ("python3 -c \"import sys; sys.path.insert(0,'/opt/afos/lib');"
+                   " import afos; print(afos.__version__)\"")
+
+        m.value("rm -rf /tmp/u && mkdir -p /tmp/u && cp -r /opt/afos/lib/. /tmp/u/")
+        m.value("sed -i 's/^__version__.*/__version__ = \"0.0.2\"/' /tmp/u/afos/__init__.py")
+        m.value("tar -czf /tmp/good.tgz -C /tmp/u .")
+        m.ask(":update /tmp/good.tgz", "update applied", soft=True)
+        r.check("the console comes back after the agent replaces itself", m.resync(),
+                bytes(m.buf[-800:]).decode("utf-8", "replace"))
+        r.check_eq("the running agent is the new version", m.value(version), "0.0.2")
+        r.check_eq("afosd is answering on the new version",
+                   m.value("systemctl is-active afosd.service"), "active")
+
+        # The failure that matters: a version that installs fine and then does
+        # not come up. On a machine with no other way in, "it looked installed"
+        # and "the box went dark" are the same event.
+        m.value("rm -rf /tmp/b && mkdir -p /tmp/b && cp -r /opt/afos/lib/. /tmp/b/")
+        m.value("echo 'raise ImportError(1)' >> /tmp/b/afos/__init__.py")
+        m.value("tar -czf /tmp/bad.tgz -C /tmp/b .")
+        m.ask(":update /tmp/bad.tgz", "update failed", soft=True)
+        m.resync()
+        r.check_eq("a version that cannot import leaves the machine untouched",
+                   m.value(version), "0.0.2")
+        r.check_eq("and the agent is still answering",
+                   m.value("systemctl is-active afosd.service"), "active")
+        r.check("the refusal is on the record",
+                b"does not import" in bytes(m.buf),
+                "no refusal message in the transcript")
+
         # No tier could see this one: T0 and T1 drive the console through a
         # pipe, and T2 drove it through qemu's stdio without ever sending the
         # byte a human at a terminal would eventually send. A suspended console
@@ -359,7 +446,7 @@ def main() -> int:
         r.section("it still owns the console on the SECOND boot")
         m.ask(":exec systemctl reboot", "afos>", soft=True)
         try:
-            second = m.expect(b"afos 0.0.1 -- session", BOOT_TIMEOUT, echo=args.verbose)
+            second = m.expect(BANNER, BOOT_TIMEOUT, echo=args.verbose)
             r.check("the agent owns the console after a reboot", True)
             r.check(
                 "no login prompt appeared on the second boot either",

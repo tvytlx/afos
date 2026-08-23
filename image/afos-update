@@ -1,0 +1,196 @@
+#!/usr/bin/python3
+"""afos-update -- replace the agent on a running machine, atomically.
+
+The problem this solves: the agent's code arrived frozen inside the seed ISO,
+so changing one line meant reprovisioning the machine. An OS has to answer "how
+does new software get here", and afos's answer was "it doesn't".
+
+The shape:
+
+    /opt/afos/versions/<id>/   one full, importable lib directory per version
+    /opt/afos/lib -> versions/<id>     the symlink everything runs from
+    /opt/afos/previous -> versions/<id>   what a rollback goes back to
+
+A new version is unpacked beside the current one, imported to prove it is not
+obviously broken, and only then does the symlink move -- via rename, so there
+is no instant where /opt/afos/lib does not resolve.
+
+Then the part that matters on a machine with no other way in: after restarting
+afosd, this waits for the daemon to actually answer on its socket. Starting is
+not the same as working, and "the new agent installed fine and the box went
+dark" is the failure this whole file exists to prevent. If it does not answer,
+the symlink goes back and afosd is restarted on the old version.
+
+Deliberately standalone and stdlib-only: it must not import from the very
+directory it is replacing, and it must keep working when that directory is
+broken.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path("/opt/afos")
+VERSIONS = ROOT / "versions"
+LIB = ROOT / "lib"
+PREVIOUS = ROOT / "previous"
+SOCKET = "/run/afos/afosd.sock"
+HEALTHY_WITHIN = 45.0
+
+
+def log(msg: str) -> None:
+    print(f"afos-update: {msg}", flush=True)
+
+
+def unpack(tarball: Path) -> Path:
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()[:12]
+    staging = Path(tempfile.mkdtemp(prefix=".incoming-", dir=VERSIONS))
+    with tarfile.open(tarball) as tar:
+        # Refuse paths that escape the staging directory.
+        for member in tar.getmembers():
+            target = (staging / member.name).resolve()
+            if not str(target).startswith(str(staging.resolve())):
+                raise SystemExit(f"afos-update: refusing path outside archive: {member.name}")
+        # filter="data" refuses absolute paths, traversal, device nodes and
+        # setuid bits. The explicit loop above stays: this runs as root against
+        # an archive that arrived from outside, and the two checks fail
+        # differently -- the loop names the offending member.
+        try:
+            tar.extractall(staging, filter="data")
+        except TypeError:  # Python < 3.11.4
+            tar.extractall(staging)
+    return _settle(staging, digest)
+
+
+def _settle(staging: Path, digest: str) -> Path:
+    final = VERSIONS / digest
+    if final.exists():
+        shutil.rmtree(staging)
+        log(f"version {digest} is already installed")
+        return final
+    staging.rename(final)
+    return final
+
+
+def importable(version: Path) -> bool:
+    """Prove the candidate imports before anything points at it."""
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]); import afos; print(afos.__version__)",
+         str(version)],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        log(f"candidate does not import:\n{probe.stderr.strip()}")
+        return False
+    log(f"candidate imports cleanly, version {probe.stdout.strip()}")
+    return True
+
+
+def point(link: Path, target: Path) -> None:
+    """Move a symlink atomically -- there is no moment where it does not resolve."""
+    tmp = link.with_name(link.name + ".swapping")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    tmp.symlink_to(target)
+    os.replace(tmp, link)
+
+
+def answers() -> bool:
+    """Not 'did the unit start' -- did the daemon answer.
+
+    A unit that starts and a machine you can reach are different claims, and on
+    this machine only the second one matters.
+    """
+    deadline = time.monotonic() + HEALTHY_WITHIN
+    while time.monotonic() < deadline:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(5)
+                sock.connect(SOCKET)
+                sock.sendall(
+                    json.dumps({"t": "hello", "frontend": "afos-update"}).encode() + b"\n"
+                )
+                reply = sock.makefile("rb").readline()
+                if json.loads(reply).get("t") == "welcome":
+                    return True
+        except (OSError, ValueError, json.JSONDecodeError):
+            time.sleep(0.5)
+    return False
+
+
+def restart() -> None:
+    subprocess.run(["systemctl", "restart", "afosd.service"], check=False)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="afos-update", description=__doc__)
+    ap.add_argument("tarball", type=Path, help="a lib directory, tar+gzipped")
+    ap.add_argument("--keep", type=int, default=3, help="how many old versions to retain")
+    args = ap.parse_args()
+
+    if not args.tarball.is_file():
+        log(f"no such file: {args.tarball}")
+        return 2
+    VERSIONS.mkdir(parents=True, exist_ok=True)
+
+    current = LIB.resolve() if LIB.is_symlink() else None
+    candidate = unpack(args.tarball)
+
+    if not importable(candidate):
+        log("refusing to install a version that does not import; nothing changed")
+        return 1
+    if current == candidate:
+        log("already running this version")
+        return 0
+
+    log(f"switching {current.name if current else '(none)'} -> {candidate.name}")
+    point(LIB, candidate)
+    restart()
+
+    if answers():
+        if current:
+            point(PREVIOUS, current)
+        prune(args.keep, keep_also={candidate, current})
+        log("update complete, agent is answering")
+        return 0
+
+    log("the new version did not answer on its socket; rolling back")
+    if current is None:
+        log("nothing to roll back to -- break-glass is the way in from here")
+        return 1
+    point(LIB, current)
+    restart()
+    if answers():
+        log(f"rolled back to {current.name}, agent is answering")
+    else:
+        log("ROLLBACK ALSO FAILED -- expect break-glass on the serial console")
+    return 1
+
+
+def prune(keep: int, keep_also: set) -> None:
+    versions = sorted(
+        (p for p in VERSIONS.iterdir() if p.is_dir() and not p.name.startswith(".")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in versions[keep:]:
+        if stale in keep_also or stale.name == "seed":
+            continue
+        shutil.rmtree(stale, ignore_errors=True)
+        log(f"pruned {stale.name}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

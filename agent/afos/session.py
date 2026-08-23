@@ -8,6 +8,7 @@ stream. A frontend dying does not end the conversation -- frontends are views.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import secrets
@@ -29,6 +30,7 @@ Sink = Callable[[dict[str, Any]], Awaitable[None]]
 # python3-systemd binding, because adding a dependency is a decision this
 # project has not made yet.
 audit = logging.getLogger("afos.audit")
+log = logging.getLogger("afos.session")
 
 _ids = itertools.count(1)
 # Ids restarted at s1 on every afosd restart, so a frontend reconnecting with a
@@ -138,6 +140,16 @@ class Session:
             text = await self._inbox.get()
             try:
                 await self._run_turn(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # The pump must outlive anything a turn can do to it. Letting
+                # the exception end this task left the session accepting input
+                # and answering nothing -- deaf, with no error, on a machine
+                # where this may be the only session there is.
+                log.exception("turn failed in session %s", self.id)
+                with contextlib.suppress(Exception):
+                    await self.emit("error", f"turn failed: {type(e).__name__}: {e}")
             finally:
                 self._inbox.task_done()
 

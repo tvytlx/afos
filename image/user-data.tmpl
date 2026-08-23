@@ -22,6 +22,21 @@ ssh_pwauth: false
 ssh_authorized_keys:
   - @TEST_SSH_KEY@
 
+# bootcmd runs in cloud-init's init stage, which is far earlier than runcmd --
+# early enough to matter, because getty.target is reached within seconds of boot
+# and runcmd does not happen until provisioning is nearly over. Without this the
+# provisioning boot really does print "afos login:" on the serial console and
+# leave it there for ten seconds, which is the one thing this project exists to
+# remove. It runs on every boot, which also makes it a backstop if a future
+# change ever un-masks a getty.
+bootcmd:
+  # The TEMPLATES, not instances. Masking getty@tty1 leaves getty@tty2 alone,
+  # and logind autospawns it the moment someone presses Ctrl-Alt-F2 -- a login
+  # prompt on a machine that is not supposed to have one. Masking getty@.service
+  # covers every instance, named or not.
+  - [sh, -c, "systemctl mask getty@.service serial-getty@.service getty-static.service autovt@.service 2>/dev/null || true"]
+  - [sh, -c, "systemctl stop 'getty@*' 'serial-getty@*' 2>/dev/null || true"]
+
 write_files:
   - path: /etc/systemd/system/afosd.service
     content: |
@@ -45,6 +60,10 @@ write_files:
     permissions: '0644'
     content: |
 @SSHD_CONF@
+  - path: /usr/local/bin/afos-update
+    permissions: '0755'
+    content: |
+@AFOS_UPDATE@
   - path: /opt/afos/packages.keep
     content: |
 @PACKAGES_KEEP@
@@ -79,7 +98,10 @@ write_files:
 
 runcmd:
   # 1. Install the agent.
-  - [sh, -c, "mkdir -p /opt/afos/lib && tar -xzf /opt/afos/agent.tar.gz -C /opt/afos/lib"]
+  # Versioned from the first boot, so an update is a symlink move rather
+  # than an in-place overwrite of the directory the agent is running from.
+  - [sh, -c, "mkdir -p /opt/afos/versions/seed && tar -xzf /opt/afos/agent.tar.gz -C /opt/afos/versions/seed"]
+  - [sh, -c, "ln -sfn versions/seed /opt/afos/lib"]
   - [groupadd, -f, afos]
   - [sh, -c, "/usr/local/bin/afosd --help >/dev/null || { echo 'afos: agent does not run'; exit 1; }"]
 
@@ -90,7 +112,11 @@ runcmd:
 
   # 3. Subtract every interactive entry that is not the agent. Masked, not
   #    disabled: the difference between "not started" and "cannot be started".
-  - [sh, -c, ". /run/afos-serial.env; systemctl mask getty@tty1.service getty-static.service \"serial-getty@$AFOS_SERIAL.service\""]
+  - [sh, -c, "systemctl mask getty@.service serial-getty@.service getty-static.service autovt@.service"]
+  # The logind drop-in only takes effect when logind reads it. Without this,
+  # NAutoVTs=0 is true from the *second* boot -- and the provisioning boot,
+  # the one everything is verified on, still autospawns virtual terminals.
+  - [sh, -c, "systemctl restart systemd-logind.service 2>/dev/null || true"]
   # Masking does not stop a unit that is already running, and getty.target is
   # reached long before cloud-init gets here -- so without this the first boot
   # really does serve a human login prompt on tty1 for the life of that boot,

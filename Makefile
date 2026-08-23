@@ -75,8 +75,10 @@ boot: image  ## T2: boot afos on the serial console (Ctrl-A X to quit)
 ssh:  ## T2: ssh into the running VM (port 2222)
 	ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost
 
+# PYTHONUNBUFFERED: this gate runs for minutes, and block-buffered output
+# means a watcher sees nothing at all until it is over.
 accept-t2: image  ## T2 acceptance: the real boot (slow -- this is the gate)
-	AFOS_BUILD_DIR=$(BUILD) scripts/accept-t2.py
+	PYTHONUNBUFFERED=1 AFOS_BUILD_DIR=$(BUILD) scripts/accept-t2.py
 
 accept: accept-t0 accept-t1 accept-t2  ## run every tier's acceptance, fast to slow
 

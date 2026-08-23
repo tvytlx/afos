@@ -260,24 +260,79 @@ exit code and the duration, with a separate record if it was cancelled. It is
 deliberately not the `python3-systemd` binding, because adding a dependency is a
 decision this project has not made yet — see below.
 
-## Open question: how does code reach an afos machine?
+## How code reaches an afos machine
 
-The current answer, arrived at by accident rather than decision: a base64
-tarball of pure-Python source inside a seed ISO, with no package manager
-involved. T0 and T1 `pip install`; T2 untars. That divergence is invisible until
-the first dependency is added, at which point T0 and T1 stay green and T2 boots
+An OS has to answer this, and afos's answer used to be "it doesn't": the agent
+arrived as a tarball frozen inside the seed ISO, so changing one line meant
+reprovisioning. Worse, the tiers disagreed about it — T0 and T1 `pip install`,
+T2 untarred source onto an image with no package manager — so the first
+dependency added would have kept both fast tiers green and booted T2 straight
 into break-glass.
 
-`image/build-seed.py` now refuses to build a seed whose `pyproject.toml`
-declares dependencies, so the trap is a build error with a name on it. That is a
-guard, not an answer. The answer is a choice — vendor a wheelhouse into the seed
-and `pip install --no-index`, or build a real rootfs — and it should be made
-before wiring up a model, because a model SDK is exactly the dependency that
-springs it.
+### Dependencies are resolved at build time, not on the machine
 
-There is also no way to update the agent on a running machine. Today that is
-`make reset`.
+`pip download` runs on the build host, for the **target** platform, and the
+wheels are unpacked into the lib directory that ships:
 
+```
+build/wheels/    pydantic_core-…-cp312-…-manylinux_2_17_aarch64.whl
+build/lib-stage/ afos/  pydantic/  anyio/  …  VENDORED
+```
+
+Two details carry the weight:
+
+- **`--platform manylinux_2_17_aarch64 --python-version 3.12`**, not whatever
+  this laptop is. A macOS wheel unpacked onto the image imports perfectly on the
+  machine that built it and fails on the one that runs it — which is the exact
+  failure this mechanism exists to prevent.
+- **`--only-binary=:all:`**. A package with no wheel for the target cannot be
+  installed on a machine with no compiler and no pip, so the build fails
+  loudly here rather than at first boot.
+
+The image still has no package manager, which is the point: `pip` would drag
+setuptools and its tree onto a system whose premise is subtraction. T2 asserts
+`pip3` is absent, and separately that every vendored package actually imports
+*on the machine* — because "the wheels downloaded" and "the imports work" are
+different claims.
+
+The seed is byte-for-byte reproducible: tar members are normalised **and** gzip
+is given `mtime=0`, without which every build produced a different blob no
+matter how normalised the members were.
+
+### Updates are a symlink move, with the rollback that makes it safe
+
+```
+/opt/afos/versions/<id>/     one full, importable lib directory per version
+/opt/afos/lib -> versions/<id>       what everything runs from
+/opt/afos/previous -> versions/<id>  what a rollback goes back to
+```
+
+`afos-update <tarball>` — reachable from the agent as `:update`:
+
+1. unpack beside the current version, refusing any path that escapes the archive
+2. **import it in a subprocess** — a version that cannot load never gets pointed at
+3. move the symlink by `rename`, so there is no instant where `/opt/afos/lib`
+   does not resolve
+4. restart `afosd`, then **wait for the daemon to answer on its socket** — not
+   for the unit to report started. "The new agent installed fine and the box
+   went dark" is the failure this step exists to catch, and starting is not the
+   same as working
+5. if it does not answer: point the symlink back, restart, and say so
+
+It runs under `systemd-run --collect`, not as a child of `afosd`: anything the
+agent spawns lives in afosd's cgroup, and `KillMode=mixed` takes that down on
+restart — an updater that dies halfway through its own restart is precisely how
+a machine ends up pointing at a version that never loaded.
+
+The updater is standalone and stdlib-only by necessity: it must not import from
+the directory it is replacing, and it has to keep working when that directory is
+broken.
+
+T2 proves both directions — a good version replaces the running agent and the
+console comes back on it, and a version with a deliberate `ImportError` is
+refused with the machine left untouched and still answering.
+
+## Where the model goes
 ## Where the model goes
 ## Where the model goes
 

@@ -8,8 +8,16 @@
 # (getty binaries stay: the break-glass path needs agetty. What goes is the
 #  machinery that presents a login to anyone who did not ask for rescue.)
 
-# --- cloud/provisioning agents that can be told to open a shell ------------
-# cloud-init is purged only AFTER first boot has used it; see build-rootfs.sh.
+# --- cloud-init stays, deliberately ----------------------------------------
+# An earlier version of this file said cloud-init was purged after first boot
+# and pointed at a build-rootfs.sh that does not exist. It was never removed.
+#
+# It is now load-bearing on EVERY boot: bootcmd masks the gettys before
+# getty.target is reached, which is the only hook early enough to stop the
+# provisioning boot printing a login prompt. Keeping it is a decision, not an
+# oversight -- with the cost stated plainly: cloud-init executes whatever its
+# datasource says, so anyone who can attach a CIDATA volume gets root without
+# going through the agent.
 
 # --- interactive helpers with no meaning on an agent-only box --------------
 ubuntu-advantage-tools

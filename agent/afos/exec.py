@@ -77,7 +77,19 @@ async def run(
 
 
 def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """Kill the whole tree, and nobody else's.
+
+    start_new_session=True made the child a process group leader, so its pgid is
+    its pid and there is no need to ask the kernel for it. Asking would be worse
+    than useless: os.getpgid() on a pid that has already been reaped can name a
+    group that now belongs to something else, and this runs as root.
+
+    The returncode check is the same guard from the other side -- once the child
+    has been reaped, its pid is fair game for reuse and must not be signalled.
+    """
+    if proc.returncode is not None:
+        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
