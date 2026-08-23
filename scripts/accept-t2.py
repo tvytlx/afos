@@ -31,6 +31,15 @@ TURN_TIMEOUT = 120.0
 # something other than the agent is asking a human for something.
 LOGIN_PROMPT = re.compile(rb"(?m)^\s*\S+ login:|^Password:", re.IGNORECASE)
 
+# ...except agetty's autologin banner, which reads "afos login: root (automatic
+# login)". It contains "login:" but asks for nothing -- it is break-glass
+# working as designed, and matching it would fail the very check it satisfies.
+AUTOLOGIN = re.compile(rb"(?m)^.*login: \S+ \(automatic login\).*$")
+
+
+def asks_for_credentials(data: bytes) -> bool:
+    return LOGIN_PROMPT.search(AUTOLOGIN.sub(b"", data)) is not None
+
 
 class Machine:
     """A booted afos, driven through its own console."""
@@ -100,7 +109,7 @@ class Report:
             self.failed += 1
             print(f"  {RED}FAIL{OFF} {desc}")
             if detail:
-                print("\n".join("         " + l for l in detail.strip().splitlines()[:8]))
+                print("\n".join("         " + l for l in detail.strip().splitlines()[-8:]))
 
     def verdict(self) -> int:
         print(f"\n  {self.passed} passed, {self.failed} failed\n")
@@ -127,7 +136,7 @@ def main() -> int:
         r.check("the machine boots and afos-console owns the serial line", True)
         r.check(
             "no login prompt ever appeared on the console",
-            LOGIN_PROMPT.search(boot) is None,
+            not asks_for_credentials(boot),
             "a login prompt was printed -- something other than the agent is an entry point",
         )
         m.expect(b"afos>", 30.0)
@@ -137,14 +146,23 @@ def main() -> int:
         r.check("a command submitted over serial runs and answers", b"t2-alive" in out, out.decode(errors="replace"))
 
         r.section("every other way in is gone")
+        # serial-getty is instance-named after the console device, which is
+        # arch-dependent -- so ask the machine which one it has rather than
+        # asserting against the one this laptop happens to boot.
         checks = [
-            ("getty@tty1 is masked",        "systemctl is-enabled getty@tty1.service",        b"masked"),
-            ("serial-getty is masked",      "systemctl is-enabled serial-getty@ttyS0.service", b"masked"),
-            ("getty.target is not enabled", "systemctl is-enabled getty.target || true",       b"disabled"),
+            ("getty@tty1 is masked", "systemctl is-enabled getty@tty1.service", b"masked"),
+            ("the serial getty is masked",
+             "systemctl is-enabled serial-getty@$(awk 'NR==1{print $1}' /proc/consoles).service",
+             b"masked"),
+            ("no getty instance is running on any terminal",
+             "systemctl list-units --state=active --no-legend 'getty@*' 'serial-getty@*' | wc -l",
+             b"0"),
             ("no user account exists besides root",
-             "awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd | wc -l",                  b"0"),
+             "awk -F: '$3>=1000 && $3<65534 {print $1}' /etc/passwd | wc -l", b"0"),
             ("ssh password auth is off",
-             "sshd -T 2>/dev/null | grep -c '^passwordauthentication no' || echo 0",           b"1"),
+             "sshd -T 2>/dev/null | grep -c '^passwordauthentication no' || echo 0", b"1"),
+            ("the agent shipped without pip or setuptools",
+             "command -v pip3 >/dev/null && echo present || echo absent", b"absent"),
         ]
         for desc, cmd, want in checks:
             out = m.ask(f":exec {cmd}", "exit ")
@@ -170,23 +188,32 @@ def main() -> int:
         r.section("exhausting the restart limit surrenders the machine to break-glass")
         m.ask(":exec systemctl reset-failed afosd.service || true", "exit ")
         m.ask(
-            ":exec nohup sh -c 'for i in 1 2 3 4 5 6 7 8; do "
-            "systemctl is-active --quiet afosd && systemctl kill -s SIGKILL afosd.service; "
-            "sleep 1.2; done' >/dev/null 2>&1 & echo storm-started",
+            ":exec systemd-run --collect --unit=afos-storm /bin/sh -c "
+            "'for i in 1 2 3 4 5 6 7 8 9 10; do "
+            "systemctl is-active --quiet afosd.service && "
+            "systemctl kill -s SIGKILL afosd.service; sleep 1.5; done'",
             "exit 0",
         )
         try:
-            m.expect(b"afos-breakglass", 180.0, echo=args.verbose)
-            r.check("break-glass activated on the serial console", True)
+            # The proof is the root prompt itself, not a systemd log line --
+            # unit state changes are not echoed to the console at this point,
+            # and waiting for one consumes the very output that proves the
+            # handover happened.
+            window = m.expect(b"root@afos:~#", 240.0, echo=args.verbose)
+            r.check("break-glass handed a root shell to the serial console", True)
+            r.check(
+                "it was an autologin, not a login prompt",
+                not asks_for_credentials(window),
+                "a login prompt appeared -- break-glass should not ask for credentials",
+            )
+            r.check(
+                "the agent console gave up the line",
+                b"afos>" not in window.split(b"root@afos")[-1],
+                "the agent is still prompting after the machine surrendered",
+            )
         except TimeoutError:
-            r.check("break-glass activated on the serial console", False,
-                    bytes(m.buf[-1200:]).decode("utf-8", "replace"))
-        try:
-            m.expect(b"root@afos", 120.0, echo=args.verbose)
-            r.check("a root shell is now on the serial line (the way back in)", True)
-        except TimeoutError:
-            r.check("a root shell is now on the serial line (the way back in)", False,
-                    bytes(m.buf[-1200:]).decode("utf-8", "replace"))
+            r.check("break-glass handed a root shell to the serial console", False,
+                    bytes(m.buf[-2000:]).decode("utf-8", "replace"))
 
     except (TimeoutError, RuntimeError) as e:
         r.check(f"boot sequence: {e}", False,

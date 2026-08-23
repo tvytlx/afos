@@ -37,7 +37,12 @@ workbench.
 ```bash
 make test      # 9 tests, no container needed
 make boot      # downloads the Ubuntu cloud image, provisions it, boots it
+make accept    # every tier's acceptance checks, fast to slow
 ```
+
+Acceptance is executable, not a checklist to read — each tier prints PASS/FAIL
+per criterion. Last full run: **T0 13/13 · T1 18/18 · T2 16/16**. What each
+tier can and cannot prove: [docs/acceptance.md](docs/acceptance.md).
 
 `make boot` uses QEMU on the serial console — there is no display to attach to,
 by construction. Ctrl-A X to quit.
@@ -53,6 +58,7 @@ agent/afos/
   exec.py       shell as a capability, not an entry point
   protocol.py   newline-delimited JSON over a Unix socket
 init/           the systemd units that replace getty
+scripts/        acceptance checks, one per tier
 image/          cloud image → bootable afos
 ```
 

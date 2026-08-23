@@ -10,6 +10,7 @@ BUILD="${AFOS_BUILD_DIR:-build}"
 MEM="${AFOS_MEM:-2048}"
 CPUS="${AFOS_CPUS:-2}"
 DISK="${AFOS_DISK:-16G}"
+SSH_PORT="${AFOS_SSH_PORT:-2222}"
 ARCH="$(cat "$BUILD/.arch" 2>/dev/null || echo unknown)"
 BASE="$(ls "$BUILD"/ubuntu-*-server-cloudimg-*.img 2>/dev/null | head -1 || true)"
 OVERLAY="$BUILD/afos.qcow2"
@@ -19,6 +20,14 @@ SEED="$BUILD/seed.iso"
 [[ -f "$SEED" ]] || { echo "afos: no seed.iso -- run 'make seed'" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null || { echo "afos: missing $1 (brew install qemu)" >&2; exit 1; }; }
+
+# A leftover VM holding the forward makes qemu die on startup with a message
+# that reads like a networking bug rather than "something else is already here".
+if lsof -nP -iTCP:"$SSH_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "afos: port $SSH_PORT is already in use -- another afos VM is probably still running." >&2
+    echo "      stop it, or set AFOS_SSH_PORT to something else." >&2
+    exit 1
+fi
 
 # A qcow2 overlay, so every boot starts from a pristine base and `make reset`
 # is a single unlink rather than a re-download.
@@ -32,7 +41,7 @@ common=(
     -m "$MEM" -smp "$CPUS"
     -drive "if=virtio,format=qcow2,file=$OVERLAY"
     -drive "if=virtio,format=raw,file=$SEED,readonly=on"
-    -netdev "user,id=net0,hostfwd=tcp::2222-:22"
+    -netdev "user,id=net0,hostfwd=tcp::$SSH_PORT-:22"
     -device virtio-net-pci,netdev=net0
     -nographic          # no display: there is nothing to display
     -serial mon:stdio   # Ctrl-A X to quit, Ctrl-A C for the qemu monitor

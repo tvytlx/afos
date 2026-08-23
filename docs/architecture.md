@@ -65,6 +65,21 @@ alternative — reject input while busy — reads fine on a tty where a human wa
 for the prompt, and loses turns everywhere else: a piped script, or two
 frontends typing at once.
 
+## What the agent spawns dies with the agent
+
+Commands run through `afos.exec` live in afosd's cgroup, and `KillMode=mixed`
+takes the whole cgroup down when the unit restarts. So a task the agent
+backgrounds does not survive an agent restart.
+
+This surfaced while writing the T2 acceptance run: a kill-storm loop the agent
+had backgrounded died with the first kill it landed, because the restart took
+its own parent's cgroup with it. The test now launches it as a transient unit
+with `systemd-run --collect`.
+
+Treat it as the rule rather than a quirk: work that must outlive the agent has
+to be its own unit. Nothing is orphaned by accident, which is the behaviour you
+want on a machine where the agent is the only supervisor a human talks to.
+
 ## Break-glass
 
 A machine with no getty is a brick the moment the agent stops coming up, so the
@@ -73,7 +88,7 @@ way back in is part of the design rather than a rescue afterthought.
 | trigger | mechanism |
 |---|---|
 | at boot | append `systemd.unit=afos-rescue.target` to the kernel cmdline |
-| at runtime | `afosd` exceeds `StartLimitBurst=5`; `OnFailure=` isolates the rescue target |
+| at runtime | `afosd` exceeds `StartLimitBurst=5`; `afos-escalate@` isolates the rescue target |
 
 Both land in `afos-breakglass.service`, an autologin root agetty on the serial
 console. It is never `WantedBy` a normal target, so a healthy boot never starts
@@ -82,6 +97,25 @@ it — and both paths are visible in the journal.
 Using systemd's own `systemd.unit=` rather than a custom kernel-cmdline
 condition is deliberate: it is the mechanism every Linux admin already knows,
 and it costs nothing to adopt.
+
+### Escalation is conditional, and that took a helper unit
+
+`OnFailure=` fires on *every* failure, not only when the restart limit is hit.
+Wired straight to the rescue target it produced the opposite of the intended
+behaviour: one transient crash isolated rescue, whose `Conflicts=` then
+cancelled the restart systemd had already scheduled — so a single SIGKILL took
+the agent down for good and opened a root shell.
+
+`afos-escalate@.service` holds the condition systemd has no syntax for. Two
+details in it are not obvious and are both load-bearing:
+
+- It reads **`ActiveState`, not `Result`.** When the start limit is hit systemd
+  leaves `Result` at the original cause (`signal`, `exit-code`); only the state
+  separates `activating (auto-restart)` from `failed`.
+- It sets **`StartLimitIntervalSec=0`.** It is triggered once per failure, so a
+  restart-looping daemon triggers it in a burst — with a rate limit of its own
+  it gets refused for "start request repeated too quickly" exactly when it is
+  needed.
 
 ## Wire protocol
 
