@@ -1,0 +1,34 @@
+[Unit]
+Description=afos failure escalation for %i
+Documentation=https://github.com/tvytlx/afos
+# systemd's OnFailure= fires on *every* failure, which is not the policy afos
+# wants: a transient crash should be absorbed by Restart=, and only a daemon
+# that cannot stay up at all should surrender the machine to break-glass.
+# There is no conditional OnFailure=, so the condition lives here.
+#
+# Without it, one SIGKILL takes the agent down for good and opens a root shell,
+# because the rescue target's Conflicts= cancels the restart systemd had
+# already scheduled.
+DefaultDependencies=no
+# This unit is triggered once per failure, so a restart-looping daemon triggers
+# it in a burst. With a rate limit it would be refused for "start request
+# repeated too quickly" -- exactly when it is needed most.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# The condition is ActiveState, not Result. When the start limit is hit systemd
+# leaves Result at the original cause ('signal', 'exit-code') and only the state
+# distinguishes the two cases:
+#
+#   restart pending -> activating (auto-restart)   absorb, do nothing
+#   limit exhausted -> failed                      escalate
+#
+# The delay lets systemd settle that state before it is read.
+ExecStart=/bin/sh -c '\
+  sleep 2; \
+  if systemctl is-failed --quiet %i; then \
+    echo "afos: %i is in failed state -- isolating rescue"; \
+    exec systemctl isolate afos-rescue.target; \
+  fi; \
+  echo "afos: %i failed but systemd is still restarting it -- absorbed"'

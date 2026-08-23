@@ -3,15 +3,20 @@ Description=afos agent daemon
 Documentation=https://github.com/tvytlx/afos
 After=network-online.target
 Wants=network-online.target
-# Five crashes in a minute is not a transient fault -- fall through to the
-# break-glass path instead of restart-looping a machine that has no other way in.
+# Absorb crashes, surrender only when the daemon cannot stay up at all.
+# Five failures in a minute is not transient; below that, Restart= handles it.
+# The escalation is conditional, which is why it goes through a helper unit
+# rather than OnFailure=afos-rescue.target -- see afos-escalate@.service.
 StartLimitIntervalSec=60
 StartLimitBurst=5
-OnFailure=afos-rescue.target
+OnFailure=afos-escalate@afosd.service
 
 [Service]
+# /usr/local/bin, not /usr/bin: afos installs with pip today. This moves to
+# /usr/bin the moment it ships as a package -- and until then, pointing the
+# unit at a path nothing installs to just yields 203/EXEC at boot.
 Type=exec
-ExecStart=/usr/bin/afosd
+ExecStart=/usr/local/bin/afosd
 RuntimeDirectory=afos
 RuntimeDirectoryMode=0755
 Restart=always

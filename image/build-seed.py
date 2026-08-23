@@ -26,6 +26,7 @@ UNITS = {
     "@AFOS_CONSOLE_SERVICE@": "init/afos-console@.service",
     "@AFOS_RESCUE_TARGET@": "init/afos-rescue.target",
     "@AFOS_BREAKGLASS_SERVICE@": "init/afos-breakglass.service",
+    "@AFOS_ESCALATE_SERVICE@": "init/afos-escalate@.service",
     "@LOGIND_CONF@": "init/logind.conf.d-afos.conf",
 }
 

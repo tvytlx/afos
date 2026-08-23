@@ -14,7 +14,8 @@ COMPOSE    ?= docker compose -f docker/compose.yml
 MACHINE    ?= afos-t1
 
 .DEFAULT_GOAL := help
-.PHONY: help test lint dev build shell down machine machine-rm base seed image boot ssh reset clean
+.PHONY: help test lint dev build shell ctest down machine machine-rm base seed image boot ssh reset clean \
+        accept accept-t0 accept-t1 accept-t2
 
 help:  ## show this
 	@grep -hE '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -37,6 +38,10 @@ shell: build  ## T0: a plain shell in the dev container, for poking at userspace
 ctest: build  ## run the test suite inside the container
 	$(COMPOSE) run --rm --entrypoint python3 afos -m unittest discover -s /opt/afos/agent/tests -v
 
+accept-t0: build  ## T0 acceptance: agent logic, protocol, shell capability
+	$(COMPOSE) run --rm -T -v "$$PWD/scripts:/opt/afos/scripts:ro" afos \
+	  bash /opt/afos/scripts/accept-t0.sh
+
 down:  ## tear down containers
 	$(COMPOSE) down --remove-orphans
 
@@ -49,6 +54,10 @@ machine:  ## T1: provision an OrbStack VM with the units installed
 
 machine-rm:  ## T1: destroy the VM
 	-orb delete $(MACHINE) --force
+
+accept-t1: machine  ## T1 acceptance: units, restart policy, break-glass
+	cat scripts/lib-accept.sh scripts/accept-t1.sh \
+	  | orb -m $(MACHINE) -u root env AFOS_SRC="$$PWD" bash -s
 
 # -- T2: real boot in QEMU --------------------------------------------------
 
@@ -65,6 +74,11 @@ boot: image  ## T2: boot afos on the serial console (Ctrl-A X to quit)
 
 ssh:  ## T2: ssh into the running VM (port 2222)
 	ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost
+
+accept-t2: image  ## T2 acceptance: the real boot (slow -- this is the gate)
+	AFOS_BUILD_DIR=$(BUILD) scripts/accept-t2.py
+
+accept: accept-t0 accept-t1 accept-t2  ## run every tier's acceptance, fast to slow
 
 reset:  ## T2: discard the VM disk, keep the download
 	rm -f $(BUILD)/afos.qcow2

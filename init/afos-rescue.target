@@ -3,5 +3,7 @@ Description=afos rescue -- the only path to a shell on this machine
 Documentation=https://github.com/tvytlx/afos
 Requires=sysinit.target afos-breakglass.service
 After=sysinit.target afos-breakglass.service
-Conflicts=afosd.service afos-console@tty1.service
+# Reached by `systemctl isolate`, which stops everything outside this tree;
+# the explicit Conflicts= makes the intent readable in `systemctl cat`.
+Conflicts=afosd.service
 AllowIsolate=yes

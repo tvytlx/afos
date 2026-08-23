@@ -28,6 +28,9 @@ write_files:
   - path: /etc/systemd/system/afos-breakglass.service
     content: |
 @AFOS_BREAKGLASS_SERVICE@
+  - path: /etc/systemd/system/afos-escalate@.service
+    content: |
+@AFOS_ESCALATE_SERVICE@
   - path: /etc/systemd/logind.conf.d/afos.conf
     content: |
 @LOGIND_CONF@

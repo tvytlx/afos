@@ -14,3 +14,4 @@ venv/
 build/
 *.qcow2
 *.iso
+*.egg-info/

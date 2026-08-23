@@ -28,6 +28,7 @@ install -m 0644 "$AFOS_SRC/init/afosd.service"           /etc/systemd/system/
 install -m 0644 "$AFOS_SRC/init/afos-console@.service"   /etc/systemd/system/
 install -m 0644 "$AFOS_SRC/init/afos-rescue.target"      /etc/systemd/system/
 install -m 0644 "$AFOS_SRC/init/afos-breakglass.service" /etc/systemd/system/
+install -m 0644 "$AFOS_SRC/init/afos-escalate@.service"  /etc/systemd/system/
 install -d -m 0755 /etc/systemd/logind.conf.d
 install -m 0644 "$AFOS_SRC/init/logind.conf.d-afos.conf" /etc/systemd/logind.conf.d/afos.conf
 
