@@ -16,7 +16,7 @@ import sys
 import threading
 from typing import Any, AsyncIterator
 
-from .protocol import SOCKET_PATH, ProtocolError, decode, encode
+from .protocol import READ_LIMIT, SOCKET_PATH, ProtocolError, decode, encode
 
 RESET = "\033[0m"
 STYLE = {
@@ -114,7 +114,12 @@ class Console:
         delay = 0.1
         while True:
             try:
-                return await asyncio.open_unix_connection(self.socket_path)
+                # Same limit as the daemon: the console must be able to read
+                # back any frame afosd is willing to send, or a large but
+                # perfectly legal output kills the only console on the box.
+                return await asyncio.open_unix_connection(
+                    self.socket_path, limit=READ_LIMIT
+                )
             except (FileNotFoundError, ConnectionRefusedError, PermissionError):
                 if not self.wait:
                     raise

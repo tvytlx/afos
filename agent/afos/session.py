@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from . import exec as shell
+from .protocol import truncate
 
 if TYPE_CHECKING:  # pragma: no cover
     from .daemon import Registry
@@ -48,6 +49,10 @@ class Session:
     def detach(self, sink: Sink) -> None:
         self._sinks.discard(sink)
 
+    def idle(self) -> bool:
+        """No turn running and nothing queued -- safe to discard."""
+        return not self._turn.locked() and self._inbox.empty()
+
     @property
     def frontends(self) -> int:
         return len(self._sinks)
@@ -55,7 +60,9 @@ class Session:
     # -- output --------------------------------------------------------------
 
     async def emit(self, stream: str, text: str) -> None:
-        await self._fanout({"t": "output", "stream": stream, "text": text}, record=True)
+        await self._fanout(
+            {"t": "output", "stream": stream, "text": truncate(text)}, record=True
+        )
 
     async def _fanout(self, frame: dict[str, Any], record: bool = False) -> None:
         if record:

@@ -15,6 +15,14 @@ from typing import Awaitable, Callable
 DEFAULT_TIMEOUT = 120.0
 TIMEOUT_RC = 124  # matches coreutils timeout(1)
 
+CHUNK = 64 * 1024
+# Longest run of bytes emitted as one line. Reading with StreamReader.readline()
+# instead would inherit asyncio's own 64KiB limit, which does not truncate --
+# it raises ValueError and fails the whole turn. `cat` on a file with one long
+# line (minified JS, a base64 blob, a JSON log) is an ordinary thing to ask an
+# agent to do, so output is chunked here rather than assumed to have newlines.
+MAX_LINE = 64 * 1024
+
 
 async def run(
     cmd: str,
@@ -35,8 +43,26 @@ async def run(
 
     async def pump() -> None:
         assert proc.stdout is not None
-        async for raw in proc.stdout:
-            await on_line(raw.decode("utf-8", "replace").rstrip("\n"))
+        buf = bytearray()
+
+        async def flush(upto: int) -> None:
+            await on_line(bytes(buf[:upto]).decode("utf-8", "replace"))
+            del buf[: upto + 1]
+
+        while True:
+            chunk = await proc.stdout.read(CHUNK)
+            if not chunk:
+                break
+            buf += chunk
+            while (nl := buf.find(b"\n")) >= 0:
+                await flush(nl)
+            # No newline in sight and the buffer is getting long: emit what we
+            # have rather than growing without bound waiting for one.
+            while len(buf) >= MAX_LINE:
+                await on_line(bytes(buf[:MAX_LINE]).decode("utf-8", "replace"))
+                del buf[:MAX_LINE]
+        if buf:
+            await on_line(bytes(buf).decode("utf-8", "replace"))
 
     try:
         await asyncio.wait_for(asyncio.gather(pump(), proc.wait()), timeout)

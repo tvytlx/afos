@@ -13,7 +13,11 @@ import unittest
 from pathlib import Path
 
 from afos.daemon import Daemon
-from afos.protocol import decode, encode
+from afos.protocol import MAX_FRAME, READ_LIMIT, decode, encode
+from afos.session import SCROLLBACK
+
+MAX_FRAME_CAP = MAX_FRAME
+SCROLLBACK_CAP = SCROLLBACK
 
 
 class Harness:
@@ -33,7 +37,9 @@ class Harness:
         self.tmp.cleanup()
 
     async def connect(self, frontend: str = "test", session: str | None = None):
-        reader, writer = await asyncio.open_unix_connection(self.socket)
+        reader, writer = await asyncio.open_unix_connection(
+            self.socket, limit=READ_LIMIT
+        )
         writer.write(encode({"t": "hello", "frontend": frontend, "session": session}))
         await writer.drain()
         welcome = decode(await reader.readline())
@@ -214,3 +220,88 @@ class ConsoleWaitTest(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(console._connect(), timeout=5)
         finally:
             tmp.cleanup()
+
+
+class ResourceLimitTest(unittest.IsolatedAsyncioTestCase):
+    """afosd runs for the life of the machine, and is the only way into it.
+
+    "Small leak" and "eventually a brick" are the same sentence here, so the
+    limits are tested rather than assumed.
+    """
+
+    async def test_oversize_frame_does_not_kill_the_frontend(self) -> None:
+        """A 200KB paste used to raise ValueError out of asyncio's readline and
+        take the connection down with an unhandled traceback. On tty1 that is
+        the machine's only console."""
+        async with Harness() as h:
+            reader, writer, _ = await h.connect()
+            writer.write(encode({"t": "input", "text": "A" * 200_000}))
+            await writer.drain()
+            await collect(reader, "no model wired up", timeout=10)
+
+            # Still usable afterwards -- that is the property that matters.
+            writer.write(encode({"t": "input", "text": ":exec echo survived-the-paste"}))
+            await writer.drain()
+            seen = await collect(reader, "survived-the-paste", timeout=10)
+            self.assertTrue(
+                any("survived-the-paste" in str(f.get("text", "")) for f in seen)
+            )
+            writer.close()
+
+    async def test_unreachable_sessions_are_reaped(self) -> None:
+        async with Harness() as h:
+            for _ in range(20):
+                r, w, _ = await h.connect(session="new")
+                w.close()
+                await w.wait_closed()
+            await asyncio.sleep(0.5)
+            live = h.daemon.registry.sessions
+            self.assertEqual(
+                len(live), 1, f"expected only the default session, got {list(live)}"
+            )
+
+    async def test_a_session_still_working_is_not_reaped(self) -> None:
+        """Reaping must not race a turn that is still producing output for a
+        frontend that will reattach."""
+        async with Harness() as h:
+            r1, w1, hello = await h.connect(session="new")
+            w1.write(encode({"t": "input", "text": ":exec sleep 1; echo late"}))
+            await w1.drain()
+            await collect(r1, "busy", timeout=5)
+            w1.close()
+            await w1.wait_closed()
+            await asyncio.sleep(0.3)
+            self.assertIn(
+                hello["session"],
+                h.daemon.registry.sessions,
+                "a session with work in flight was reaped",
+            )
+
+    async def test_a_frontend_that_never_reads_cannot_grow_the_daemon(self) -> None:
+        from afos.daemon import OUTBOX_LIMIT
+
+        async with Harness() as h:
+            reader, writer, _ = await h.connect(session="new")
+            writer.write(encode({"t": "input", "text": ":exec seq 1 60000"}))
+            await writer.drain()
+            await asyncio.sleep(3)  # deliberately never read from `reader`
+
+            session = [s for s in h.daemon.registry.sessions.values()][-1]
+            self.assertLessEqual(len(session.history), SCROLLBACK_CAP)
+            # The queue is bounded; the slow frontend loses frames rather than
+            # taking the machine with it.
+            self.assertLessEqual(OUTBOX_LIMIT, 8192)
+            writer.close()
+
+    async def test_a_huge_single_output_is_truncated(self) -> None:
+        async with Harness() as h:
+            reader, writer, _ = await h.connect()
+            writer.write(encode({"t": "input", "text": ":exec head -c 6000000 /dev/zero | tr '\\0' 'x'"}))
+            await writer.drain()
+            frames = await collect(reader, "exit 0", timeout=30)
+            for f in frames:
+                self.assertLessEqual(
+                    len(encode(f)), MAX_FRAME_CAP,
+                    "afosd emitted a frame no peer could read back",
+                )
+            writer.close()
