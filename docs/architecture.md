@@ -80,6 +80,32 @@ Treat it as the rule rather than a quirk: work that must outlive the agent has
 to be its own unit. Nothing is orphaned by accident, which is the behaviour you
 want on a machine where the agent is the only supervisor a human talks to.
 
+## Nothing on the path to the console may give up
+
+There is exactly one way for a human to reach this machine. Every unit between
+boot and that console — `afosd`, `afos-console@` — must therefore keep trying
+forever, and must not be gated on anything that can be unavailable.
+
+Two concrete rules follow, and both were learned the expensive way:
+
+- **`Wants=`, never `Requires=`, along that path.** `afos-console` originally
+  required `afosd`. A single failed `afosd` start job failed the console's
+  dependency, systemd never retries a dependency failure, and `afosd` itself
+  recovered seconds later — leaving a machine with a healthy agent, no console,
+  and no getty. From the second boot onward it was unreachable except by
+  editing the kernel command line. `StartLimitIntervalSec=0` on the console
+  makes the same point about restart limits: a console that gives up is a brick.
+- **No network in the dependency chain.** `afosd` is not ordered after
+  `network-online.target`. It binds a Unix socket and needs no network to serve
+  a console, and gating the only interactive entry on DHCP is what dragged it
+  into the failing early-boot job to begin with. A brain that needs the network
+  deals with its absence at call time.
+
+The escalation logic behaved perfectly during that failure and made it worse:
+`afosd` was healthy, so break-glass correctly stayed shut. Correct components
+composed into an unreachable machine — which is the argument for testing the
+property end to end, on the boot that matters, rather than testing the parts.
+
 ## Break-glass
 
 A machine with no getty is a brick the moment the agent stops coming up, so the

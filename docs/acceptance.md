@@ -7,11 +7,11 @@ problem tells you less than one that shows all of them.
 ```bash
 make accept-t0     # ~40s   13 checks
 make accept-t1     # ~3min  18 checks   (creates an OrbStack machine)
-make accept-t2     # ~4min  16 checks   (downloads 618MB once, then boots QEMU)
+make accept-t2     # ~6min  20 checks   (downloads 618MB once, then boots QEMU twice)
 make accept        # all three, fast to slow
 ```
 
-Last full run: **T0 13/13 · T1 18/18 · T2 16/16.**
+Last full run: **T0 13/13 · T1 18/18 · T2 20/20.**
 
 ## What each tier can and cannot prove
 
@@ -22,7 +22,7 @@ the tier below is structurally blind to, and none of them is redundant.
 |---|---|---|---|
 | **T0** | container | agent logic, wire protocol, shell capability | anything about boot, tty, or init |
 | **T1** | live systemd, no boot | units, restart policy, escalation decision | boot; and not the isolate itself (see below) |
-| **T2** | real boot in QEMU | the agent owns the console and nothing else does | — this is the gate |
+| **T2** | real boot in QEMU | the agent owns the console and nothing else does, on the first boot *and* after a reboot | — this is the gate |
 
 ## T0 — `make accept-t0`
 
@@ -85,6 +85,14 @@ by definition the working interactive entry, and the serial transcript
 - **break-glass is present but shut** — not running on a healthy boot; the
   rescue target is installed and reachable
 - **systemd, not the agent, is PID 1** — and afosd runs as a supervised unit
+- **it still owns the console on the second boot** — reboot, then re-assert the
+  banner, no login prompt, no unit on the path to the console failed, afosd
+  active. This section exists because its absence hid a bug that left the
+  machine with no interactive entry at all from its second boot onward: every
+  other check runs on the first boot, where cloud-init hand-starts the console
+  as the last step of provisioning and so guarantees the property by side
+  effect. A machine that only works the first time it is switched on is not
+  an OS.
 - **exhausting the restart limit surrenders the machine** — a kill storm drives
   afosd past its restart limit; break-glass hands a root shell to the serial
   console, by autologin rather than a credential prompt, and the agent console
