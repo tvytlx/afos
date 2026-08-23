@@ -169,3 +169,48 @@ class InterruptTest(unittest.IsolatedAsyncioTestCase):
             await writer.drain()
             await collect(reader, "nothing to interrupt", timeout=5)
             writer.close()
+
+
+class ConsoleWaitTest(unittest.IsolatedAsyncioTestCase):
+    """The console must win a race it is guaranteed to sometimes lose.
+
+    systemd starts afos-console alongside afosd, so the socket is often not
+    there yet. Exiting turns that into a restart loop that churns the tty; on a
+    machine with no getty it once turned into no way in at all.
+    """
+
+    async def test_wait_blocks_until_the_daemon_appears(self) -> None:
+        from afos.client import Console
+
+        tmp = tempfile.TemporaryDirectory()
+        socket = str(Path(tmp.name) / "late.sock")
+        try:
+            console = Console(socket, None, color=False, wait=True)
+            connecting = asyncio.create_task(console._connect())
+
+            # Nothing to connect to yet: it must still be trying.
+            await asyncio.sleep(0.3)
+            self.assertFalse(connecting.done(), "console gave up before afosd existed")
+
+            daemon = Daemon(socket)
+            await daemon.start()
+            serving = asyncio.create_task(daemon.serve_forever())
+            try:
+                _, writer = await asyncio.wait_for(connecting, timeout=10)
+                writer.close()
+            finally:
+                serving.cancel()
+                await daemon.stop()
+        finally:
+            tmp.cleanup()
+
+    async def test_without_wait_it_fails_fast(self) -> None:
+        from afos.client import Console
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            console = Console(str(Path(tmp.name) / "absent.sock"), None, color=False)
+            with self.assertRaises(OSError):
+                await asyncio.wait_for(console._connect(), timeout=5)
+        finally:
+            tmp.cleanup()

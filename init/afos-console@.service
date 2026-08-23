@@ -3,14 +3,25 @@ Description=afos console on %I
 Documentation=https://github.com/tvytlx/afos
 # This unit is what replaces getty. Conflicts= makes that literal: systemd will
 # not run both on the same tty.
+# Wants=, NOT Requires=. Requires= makes a single failed afosd start job
+# fail this unit's dependency, and systemd never retries a dependency
+# failure -- which on a machine with no getty means no way in at all, for
+# good, from a fault afosd itself recovered from seconds later.
+# Reproduced on a second boot: build/secondboot-serial.log.
 After=afosd.service
-Requires=afosd.service
+Wants=afosd.service
 Conflicts=getty@%i.service
 Before=getty.target
+# No unit on the path to the only console may ever stop trying. Without
+# this the console exhausts the default start limit while afosd is still
+# coming up, and gives up permanently.
+StartLimitIntervalSec=0
 
 [Service]
 Type=idle
-ExecStart=/usr/local/bin/afos-console
+# --wait: block until afosd is listening instead of exiting and churning
+# the tty through a restart loop.
+ExecStart=/usr/local/bin/afos-console --wait
 Restart=always
 RestartSec=1
 UtmpIdentifier=%I

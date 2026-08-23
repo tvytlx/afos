@@ -78,12 +78,22 @@ class Machine:
         consumed = bytes(self.buf[start:])
         return consumed
 
-    def ask(self, line: str, marker: str) -> bytes:
-        """Send a line to the agent and read until its marker comes back."""
+    def ask(self, line: str, marker: str, soft: bool = False) -> bytes:
+        """Send a line to the agent and read until its marker comes back.
+
+        soft=True tolerates the marker never arriving -- `systemctl reboot`
+        takes the console down mid-turn, which is the expected outcome, not a
+        failure.
+        """
         assert self.proc.stdin is not None
         self.proc.stdin.write(line.encode() + b"\n")
         self.proc.stdin.flush()
-        return self.expect(marker.encode(), TURN_TIMEOUT)
+        try:
+            return self.expect(marker.encode(), 20.0 if soft else TURN_TIMEOUT)
+        except TimeoutError:
+            if soft:
+                return b""
+            raise
 
     def close(self) -> None:
         self.proc.terminate()
@@ -179,6 +189,32 @@ def main() -> int:
         r.check("PID 1 is systemd", b"systemd" in out, out.decode(errors="replace"))
         out = m.ask(":exec systemctl is-active afosd.service", "exit 0")
         r.check("afosd runs as a supervised unit", b"active" in out, out.decode(errors="replace"))
+
+        # The gap that let a bricking bug ship: every check above runs on the
+        # FIRST boot, where cloud-init hand-starts the console at the end of
+        # provisioning. That guarantees the property by side effect. A machine
+        # that only works the first time it is switched on is not an OS.
+        r.section("it still owns the console on the SECOND boot")
+        m.ask(":exec systemctl reboot", "afos>", soft=True)
+        try:
+            second = m.expect(b"afos 0.0.1 -- session", BOOT_TIMEOUT, echo=args.verbose)
+            r.check("the agent owns the console after a reboot", True)
+            r.check(
+                "no login prompt appeared on the second boot either",
+                not asks_for_credentials(second),
+            )
+            r.check(
+                "no unit on the path to the console failed",
+                b"Dependency failed for afos-console" not in second,
+                bytes(m.buf[-2000:]).decode("utf-8", "replace"),
+            )
+            m.expect(b"afos>", 60.0)
+            out = m.ask(":exec systemctl is-active afosd.service", "exit 0")
+            r.check("afosd is active on the second boot", b"active" in out,
+                    out.decode(errors="replace"))
+        except TimeoutError:
+            r.check("the agent owns the console after a reboot", False,
+                    bytes(m.buf[-2500:]).decode("utf-8", "replace"))
 
         # Last, and destructive on purpose. T1 cannot prove this -- isolating a
         # target inside an OrbStack machine tears down the channel the checks

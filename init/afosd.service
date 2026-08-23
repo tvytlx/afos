@@ -1,8 +1,11 @@
 [Unit]
 Description=afos agent daemon
 Documentation=https://github.com/tvytlx/afos
-After=network-online.target
-Wants=network-online.target
+# Deliberately NOT ordered after network-online.target. afosd binds a Unix
+# socket and needs no network to serve a console -- and the only interactive
+# entry on the machine must not be gated on DHCP. A brain that needs the
+# network handles its absence at call time, not by delaying the console.
+After=basic.target
 # Absorb crashes, surrender only when the daemon cannot stay up at all.
 # Five failures in a minute is not transient; below that, Restart= handles it.
 # The escalation is conditional, which is why it goes through a helper unit

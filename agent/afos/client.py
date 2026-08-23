@@ -30,12 +30,18 @@ PROMPT = "\033[1;32mafos>\033[0m "
 
 class Console:
     def __init__(
-        self, socket_path: str, session: str | None, color: bool, linger: float = 5.0
+        self,
+        socket_path: str,
+        session: str | None,
+        color: bool,
+        linger: float = 5.0,
+        wait: bool = False,
     ) -> None:
         self.socket_path = socket_path
         self.session = session
         self.color = color
         self.linger = linger
+        self.wait = wait
         self.busy = False
 
     def _write(self, text: str) -> None:
@@ -62,13 +68,13 @@ class Console:
 
     async def run(self) -> int:
         try:
-            reader, writer = await asyncio.open_unix_connection(self.socket_path)
-        except (FileNotFoundError, ConnectionRefusedError, PermissionError) as e:
-            print(f"afos-console: cannot reach afosd at {self.socket_path}: {e}", file=sys.stderr)
-            return 69  # EX_UNAVAILABLE
+            reader, writer = await self._connect()
         except OSError as e:
-            print(f"afos-console: {e}", file=sys.stderr)
-            return 69
+            print(
+                f"afos-console: cannot reach afosd at {self.socket_path}: {e}",
+                file=sys.stderr,
+            )
+            return 69  # EX_UNAVAILABLE
 
         writer.write(encode({"t": "hello", "frontend": _frontend_name(), "session": self.session}))
         await writer.drain()
@@ -96,6 +102,24 @@ class Console:
         outgoing.cancel()
         writer.close()
         return 0
+
+    async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Open the socket, optionally waiting for afosd to appear.
+
+        On tty1 the console is started by systemd alongside afosd, so losing the
+        race is normal and exiting would just churn the tty through a restart
+        loop. Waiting is also what makes the console survive an afosd restart
+        without a gap a human would notice.
+        """
+        delay = 0.1
+        while True:
+            try:
+                return await asyncio.open_unix_connection(self.socket_path)
+            except (FileNotFoundError, ConnectionRefusedError, PermissionError):
+                if not self.wait:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
 
     async def _drain(self, reader: asyncio.StreamReader) -> None:
         async for raw in reader:
@@ -173,11 +197,18 @@ def main() -> int:
     ap.add_argument("--socket", default=SOCKET_PATH)
     ap.add_argument("--session", default=None, help="session id, 'new', or 'system'")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument(
+        "--wait",
+        action="store_true",
+        help="block until afosd is listening instead of failing (used on tty units)",
+    )
     args = ap.parse_args()
 
     color = not args.no_color and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
     try:
-        return asyncio.run(Console(args.socket, args.session, color).run())
+        return asyncio.run(
+            Console(args.socket, args.session, color, wait=args.wait).run()
+        )
     except KeyboardInterrupt:
         return 130
 
