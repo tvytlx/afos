@@ -27,12 +27,20 @@ RestartSec=1
 KillMode=mixed
 TimeoutStopSec=10
 # A bounded cgroup failure with a journal entry, rather than a machine-wide
-# OOM. afosd is the only way into this box, so the difference between 'the
-# daemon died' and 'the kernel picked a victim' is the difference between a
-# restart and a brick. The in-process byte budget should make this
-# unreachable; it is here for the case where it does not.
-MemoryHigh=256M
-MemoryMax=512M
+# OOM. afosd is the only way into this box, so 'the daemon died' and 'the
+# kernel picked a victim' are the difference between a restart and a brick.
+#
+# Deliberately NO MemoryHigh. MemoryHigh throttles rather than failing: past
+# it the kernel reclaims harder and harder and the process crawls, forever,
+# with no error and no kill. Measured on a 2GB machine with MemoryHigh=256M:
+# a 200MB allocation returned instantly, a 400MB one never returned at all
+# (memory.events showed 5300 throttle events, oom_kill 0). Everything the
+# agent runs shares this cgroup, so that ceiling was the agent's ceiling --
+# `apt upgrade` would simply hang.
+#
+# A percentage, not a number: the right cap on a 1GB VM is not the right cap
+# on a 64GB host, and a hardcoded one is wrong on both.
+MemoryMax=50%
 StandardOutput=journal
 StandardError=journal
 

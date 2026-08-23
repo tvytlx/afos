@@ -418,6 +418,29 @@ def main() -> int:
                 b"does not import" in bytes(m.buf),
                 "no refusal message in the transcript")
 
+        # Everything the agent runs shares afosd's cgroup, so a limit meant to
+        # bound the daemon silently became the ceiling on the machine's actual
+        # work. MemoryHigh=256M throttled rather than failing: a 400MB
+        # allocation never returned and was never killed. `apt upgrade` would
+        # simply hang, with nothing in any log to say why.
+        r.section("the agent's own limits do not strangle the work")
+        r.check_eq(
+            "no memory throttle on the agent's cgroup",
+            m.value("cat /sys/fs/cgroup/system.slice/afosd.service/memory.high"),
+            "max",
+        )
+        r.check_eq(
+            "a command may use a few hundred MB without stalling",
+            m.value("python3 -c 'a=bytearray(400*1024*1024); print(\"ok\")'"),
+            "ok",
+        )
+        r.check_eq(
+            "and nothing was throttled doing it",
+            m.value("awk '/^high /{print $2}' "
+                    "/sys/fs/cgroup/system.slice/afosd.service/memory.events"),
+            "0",
+        )
+
         # No tier could see this one: T0 and T1 drive the console through a
         # pipe, and T2 drove it through qemu's stdio without ever sending the
         # byte a human at a terminal would eventually send. A suspended console

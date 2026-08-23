@@ -30,6 +30,66 @@ forwarding, and would make every agent crash a kernel panic.
    the daemon      the frontend
 ```
 
+## What the agent actually is
+
+An ordinary user-space process, boringly so. The kernel has no idea the concept
+"agent" exists — to it this is PID 1909:
+
+```
+  PID  PPID USER  STAT COMMAND
+ 1909     1 root  Ss   afosd
+```
+
+Two things about that line are the whole difference from a program you run in a
+terminal. `PPID 1` — systemd started and supervises it, not a shell. And `s` —
+it is a session leader that *owns* a terminal, because systemd hands it
+`/dev/ttyAMA0` directly, which is the slot getty used to occupy.
+
+The third difference does not show up in `ps`:
+
+```
+Uid:        0  0  0  0
+CapEff:     000001ffffffffff     all 41 capabilities
+NoNewPrivs: 0
+Seccomp:    0
+```
+
+Modern Linux root is not one switch, it is forty-one. A hardened daemon is
+usually uid 0 holding a handful of them. afosd holds every one, with no seccomp
+filter, no namespace, and no `NoNewPrivileges`. `CAP_SYS_MODULE` means it can
+load code into the running kernel; `CAP_SYS_RAWIO` means it can write the block
+device underneath the filesystem; `CAP_SYS_PTRACE` means it can read any other
+process's memory.
+
+sshd is the useful contrast: it also starts as root, but privilege separation
+means the part handling untrusted input has dropped almost everything. afos has
+no such split — the code parsing your input, the code deciding what to run, and
+the code running it are one unrestricted process.
+
+**So `:exec` is a full-root shell, and the two boundaries are different
+questions.** Socket permissions decide *who may ask*; capabilities decide *what
+gets done*. `0660 root:afos` answers only the first. Adding someone to group
+`afos` gives them root — see below.
+
+What actually constrains it today: a cgroup memory ceiling, and `:exec`'s
+timeout. Not capabilities, not seccomp, not namespaces, not an allow-list.
+
+### Memory limits belong to the daemon, not to its work
+
+Everything the agent runs shares afosd's cgroup, so a limit meant to bound the
+daemon silently becomes the ceiling on the machine's actual work.
+
+`MemoryHigh=256M` looked prudent and was not. `MemoryHigh` throttles rather than
+failing: past it the kernel reclaims harder and harder and the process crawls,
+indefinitely, with no error and no kill. Measured on a 2 GB machine — 200 MB
+returned instantly, 400 MB never returned at all, `memory.events` showing 5300
+throttle events and `oom_kill 0`. `apt upgrade` would simply hang, with nothing
+in any log to say why.
+
+There is now no `MemoryHigh`, and `MemoryMax=50%` — a percentage because the
+right cap on a 1 GB VM is not the right cap on a 64 GB host, and a hardcoded
+number is wrong on both. T2 checks all three facts.
+
 ## Sessions live in the daemon
 
 The one structural decision everything else follows from.

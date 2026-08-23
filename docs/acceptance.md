@@ -7,11 +7,11 @@ problem tells you less than one that shows all of them.
 ```bash
 make accept-t0     # ~40s   13 checks
 make accept-t1     # ~3min  18 checks   (creates an OrbStack machine)
-make accept-t2     # ~9min  42 checks   (downloads 618MB once, then boots QEMU twice)
+make accept-t2     # ~9min  45 checks   (downloads 618MB once, then boots QEMU twice)
 make accept        # all three, fast to slow
 ```
 
-Last full run: **T0 13/13 · T1 18/18 · T2 42/42.**
+Last full run: **T0 13/13 · T1 18/18 · T2 45/45.**
 
 ## What each tier can and cannot prove
 
