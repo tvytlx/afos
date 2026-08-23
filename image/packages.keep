@@ -1,0 +1,8 @@
+# Explicitly installed on top of the cloud image.
+#
+# The rule for this list: kernel, drivers, networking and init come from Ubuntu
+# untouched. Everything here exists only because afos itself needs it.
+
+python3
+python3-minimal
+ca-certificates

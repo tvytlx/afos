@@ -1,0 +1,14 @@
+services:
+  afos:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    image: afos:dev
+    container_name: afos-dev
+    # Source is bind-mounted over the baked copy: `pip install -e` means an edit
+    # on the host is live on the next daemon restart, no rebuild.
+    volumes:
+      - ../agent:/opt/afos/agent
+    stdin_open: true
+    tty: true
+    init: true

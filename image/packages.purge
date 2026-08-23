@@ -1,0 +1,28 @@
+# Removed from the Ubuntu Server cloud image.
+#
+# Server images carry no GUI, so this list is not about the desktop -- it is
+# about every remaining path a human has to a prompt that is not the agent.
+# One package per line; '#' comments and blanks ignored.
+
+# --- interactive login surfaces -------------------------------------------
+# (getty binaries stay: the break-glass path needs agetty. What goes is the
+#  machinery that presents a login to anyone who did not ask for rescue.)
+
+# --- cloud/provisioning agents that can be told to open a shell ------------
+# cloud-init is purged only AFTER first boot has used it; see build-rootfs.sh.
+
+# --- interactive helpers with no meaning on an agent-only box --------------
+ubuntu-advantage-tools
+landscape-common
+update-notifier-common
+motd-news-config
+byobu
+screen
+tmux
+command-not-found
+bash-completion
+
+# --- documentation nobody will read from a machine with no pager -----------
+man-db
+manpages
+info

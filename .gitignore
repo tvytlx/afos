@@ -9,3 +9,8 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# afos build artifacts: cloud images and VM disks
+build/
+*.qcow2
+*.iso

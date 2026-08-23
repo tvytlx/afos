@@ -1,0 +1,25 @@
+[Unit]
+Description=afos agent daemon
+Documentation=https://github.com/tvytlx/afos
+After=network-online.target
+Wants=network-online.target
+# Five crashes in a minute is not a transient fault -- fall through to the
+# break-glass path instead of restart-looping a machine that has no other way in.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+OnFailure=afos-rescue.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/afosd
+RuntimeDirectory=afos
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=1
+KillMode=mixed
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

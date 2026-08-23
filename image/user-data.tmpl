@@ -1,0 +1,71 @@
+#cloud-config
+# T2 first-boot provisioning.
+#
+# The cloud image is customised on first boot rather than by mounting and
+# chrooting it -- which keeps the whole build runnable from macOS with nothing
+# but qemu, and keeps the customisation a readable list instead of a shell
+# script operating on someone else's filesystem.
+
+hostname: afos
+preserve_hostname: false
+
+# No users. Not "a user with no password" -- none. The break-glass agetty
+# autologins root over the serial console, and that is the entire login story.
+users: []
+disable_root: false
+ssh_pwauth: false
+
+write_files:
+  - path: /etc/systemd/system/afosd.service
+    content: |
+@AFOSD_SERVICE@
+  - path: /etc/systemd/system/afos-console@.service
+    content: |
+@AFOS_CONSOLE_SERVICE@
+  - path: /etc/systemd/system/afos-rescue.target
+    content: |
+@AFOS_RESCUE_TARGET@
+  - path: /etc/systemd/system/afos-breakglass.service
+    content: |
+@AFOS_BREAKGLASS_SERVICE@
+  - path: /etc/systemd/logind.conf.d/afos.conf
+    content: |
+@LOGIND_CONF@
+  - path: /opt/afos/packages.purge
+    content: |
+@PACKAGES_PURGE@
+  - path: /opt/afos/agent.tar.gz
+    encoding: b64
+    content: @AGENT_TARBALL_B64@
+
+runcmd:
+  # 1. Install the agent.
+  - [sh, -c, "mkdir -p /opt/afos/agent && tar -xzf /opt/afos/agent.tar.gz -C /opt/afos/agent"]
+  - [sh, -c, "PIP_BREAK_SYSTEM_PACKAGES=1 pip3 install --no-cache-dir /opt/afos/agent"]
+  - [groupadd, -f, afos]
+
+  # 2. Subtract every interactive entry that is not the agent.
+  #    getty@tty1 is masked, not disabled: masking is the difference between
+  #    "not started" and "cannot be started".
+  - [systemctl, mask, "getty@tty1.service"]
+  - [systemctl, mask, "serial-getty@ttyS0.service"]
+  - [systemctl, mask, "getty-static.service"]
+  - [systemctl, disable, "getty.target"]
+
+  # 3. Install the agent as the replacement.
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, afosd.service]
+  - [systemctl, enable, "afos-console@ttyS0.service"]
+  - [systemctl, enable, "afos-console@tty1.service"]
+
+  # 4. Now that provisioning is done, remove the provisioner and the leftovers.
+  - [sh, -c, "apt-get -y purge $(grep -vE '^\\s*(#|$)' /opt/afos/packages.purge | tr '\\n' ' ') 2>/dev/null || true"]
+  - [sh, -c, "apt-get -y autoremove --purge && apt-get clean"]
+
+  # 5. Hand the console to the agent without a reboot, so `make boot` shows the
+  #    real thing on the first boot rather than the second.
+  - [systemctl, isolate, multi-user.target]
+  - [systemctl, start, afosd.service]
+  - [systemctl, start, "afos-console@ttyS0.service"]
+
+final_message: "afos provisioned in $UPTIME seconds -- the agent owns the console now"

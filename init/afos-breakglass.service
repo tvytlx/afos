@@ -1,0 +1,24 @@
+[Unit]
+Description=afos break-glass root shell on the serial console
+Documentation=https://github.com/tvytlx/afos
+# A machine with no getty and no login is a brick the moment the agent stops
+# coming up. This is the deliberate way back in, and it is reachable exactly
+# two ways -- both of them auditable:
+#
+#   at boot:   append  systemd.unit=afos-rescue.target  to the kernel cmdline
+#   at runtime: afosd exhausts StartLimitBurst, OnFailure isolates afos-rescue
+#
+# It is never WantedBy a normal target, so a healthy boot never starts it.
+DefaultDependencies=no
+After=sysinit.target
+
+[Service]
+Type=idle
+ExecStart=/sbin/agetty --autologin root --noclear ttyS0 115200 vt220
+Restart=always
+RestartSec=1
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/ttyS0
+TTYReset=yes
+TTYVHangup=yes

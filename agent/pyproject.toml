@@ -1,0 +1,18 @@
+[project]
+name = "afos"
+version = "0.0.1"
+description = "afos agent daemon and frontends"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+afosd = "afos.daemon:main"
+afos-console = "afos.client:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["afos*"]

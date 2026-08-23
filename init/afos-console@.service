@@ -1,0 +1,28 @@
+[Unit]
+Description=afos console on %I
+Documentation=https://github.com/tvytlx/afos
+# This unit is what replaces getty. Conflicts= makes that literal: systemd will
+# not run both on the same tty.
+After=afosd.service
+Requires=afosd.service
+Conflicts=getty@%i.service
+Before=getty.target
+
+[Service]
+Type=idle
+ExecStart=/usr/bin/afos-console
+Restart=always
+RestartSec=1
+UtmpIdentifier=%I
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+# No shell to drop into and nothing to log in as -- so nothing here allocates a
+# session or a controlling login. The console is the whole interface.
+IgnoreSIGPIPE=no
+
+[Install]
+WantedBy=getty.target

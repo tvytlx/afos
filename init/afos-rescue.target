@@ -1,0 +1,7 @@
+[Unit]
+Description=afos rescue -- the only path to a shell on this machine
+Documentation=https://github.com/tvytlx/afos
+Requires=sysinit.target afos-breakglass.service
+After=sysinit.target afos-breakglass.service
+Conflicts=afosd.service afos-console@tty1.service
+AllowIsolate=yes
